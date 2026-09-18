@@ -1,0 +1,85 @@
+function otfs_tr_validate_config(cfg)
+%otfs_tr_validate_config Reject unsupported or unsafe OTFS-TR settings.
+
+requiredFields = [
+    "txAddress", "rxAddress", "txRadioConfiguration", ...
+    "rxRadioConfiguration", "txAntenna", "rxAntenna", ...
+    "masterClockRate", "fsTx", "fsRx", ...
+    "signalBandwidthHz", "N", "M", "MMod", "MBits", "cpLen", ...
+    "preambleLen", "preambleRoot", "txBufferFrameCount", ...
+    "rxSamplesPerFrame", "maxDecodedFrames", "minimumValidFrames", ...
+    "availableCaptureFrames", "decodeFrameMarginRatio", ...
+    "cfoSearchHz", "cfoFineSearchStepHz", "equivalentDopplerHz", ...
+    "txTransportDataType", "rxTransportDataType"
+    ];
+for fieldIndex = 1:numel(requiredFields)
+    fieldName = requiredFields(fieldIndex);
+    if ~isfield(cfg, fieldName) || isempty(cfg.(fieldName))
+        error("otfs_tr:MissingConfiguration", ...
+            "Missing required configuration field: %s", fieldName);
+    end
+end
+
+validTransportTypes = ["int8", "int16"];
+if ~any(string(cfg.txTransportDataType) == validTransportTypes) || ...
+        ~any(string(cfg.rxTransportDataType) == validTransportTypes)
+    error("otfs_tr:InvalidTransportDataType", ...
+        "TX and RX TransportDataType must be int8 or int16.");
+end
+
+if cfg.txAddress == cfg.rxAddress
+    error("otfs_tr:SameRadioAddress", ...
+        "TX and RX must use two different X310 IP addresses.");
+end
+if cfg.fsRx < cfg.fsTx || abs(cfg.fsRx/cfg.fsTx - round(cfg.fsRx/cfg.fsTx)) > 1e-12
+    error("otfs_tr:InvalidSampleRateRatio", ...
+        "fsRx/fsTx must be a positive integer.");
+end
+if cfg.MBits ~= log2(cfg.MMod) || mod(cfg.MBits, 1) ~= 0
+    error("otfs_tr:InvalidModulationOrder", ...
+        "MMod must provide an integer number of bits per symbol.");
+end
+if cfg.cpLen < 1 || cfg.cpLen > cfg.N*cfg.M
+    error("otfs_tr:InvalidCyclicPrefix", ...
+        "cpLen must be between 1 and N*M.");
+end
+if gcd(cfg.preambleLen, cfg.preambleRoot) ~= 1
+    error("otfs_tr:InvalidPreambleRoot", ...
+        "preambleLen and preambleRoot must be coprime.");
+end
+if max(abs(cfg.cfoSearchHz)) < abs(cfg.equivalentDopplerHz)
+    error("otfs_tr:CfoSearchTooNarrow", ...
+        "The CFO search grid does not cover equivalentDopplerHz.");
+end
+interpolation = cfg.masterClockRate/cfg.fsTx;
+decimation = cfg.masterClockRate/cfg.fsRx;
+if interpolation ~= round(interpolation) || decimation ~= round(decimation)
+    error("otfs_tr:InvalidClockRateRatio", ...
+        "Master-clock interpolation and decimation must be integers.");
+end
+if cfg.txBufferFrameCount < 2 || cfg.rxSamplesPerFrame < 1
+    error("otfs_tr:InvalidHardwareBuffer", ...
+        "TX and RX hardware buffer sizes must be positive and usable.");
+end
+if cfg.decodeFrameMarginRatio < 0
+    error("otfs_tr:InvalidDecodeFrameMargin", ...
+        "decodeFrameMarginRatio must be nonnegative.");
+end
+if cfg.maxDecodedFrames < cfg.minimumValidFrames
+    error("otfs_tr:InsufficientDecodeFrameLimit", ...
+        "maxDecodedFrames must be at least minimumValidFrames.");
+end
+if cfg.availableCaptureFrames < cfg.minimumValidFrames
+    error("otfs_tr:CaptureWindowTooShort", ...
+        "The RX window cannot contain the required number of complete frames.");
+end
+if cfg.maxDecodedFrames > cfg.availableCaptureFrames
+    error("otfs_tr:DecodeFrameLimitExceedsCapture", ...
+        "maxDecodedFrames cannot exceed the complete frames in the RX window.");
+end
+if cfg.designSpectralEfficiency < cfg.minimumSpectralEfficiency
+    error("otfs_tr:SpectralEfficiencyNotMet", ...
+        "Design spectral efficiency not met: %.6g < %.6g bit/s/Hz.", ...
+        cfg.designSpectralEfficiency, cfg.minimumSpectralEfficiency);
+end
+end

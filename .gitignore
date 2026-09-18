@@ -1,0 +1,19 @@
+# Hardware captures, decoded results, and generated reports
+/results/
+
+# Local scratch directory
+/新建文件夹/
+
+# MATLAB generated files
+*.asv
+*.autosave
+*.m~
+*.mexw64
+*.mlx.autosave
+/codegen/
+/slprj/
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
