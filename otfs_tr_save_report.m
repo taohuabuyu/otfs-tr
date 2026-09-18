@@ -20,6 +20,10 @@ lines = [
     "requested equivalent Doppler/CFO = " + result.requestedDopplerHz + " Hz"
     "estimated CFO = " + result.cfoEstimateHz + " Hz"
     "median residual CFO = " + result.residualCfoHz + " Hz"
+    "SFO compensation enabled = " + localSfoField(result, "enabled", false)
+    "SFO compensation applied = " + localSfoField(result, "applied", false)
+    "estimated SFO = " + localSfoField(result, "estimatedPpm", NaN) + " ppm"
+    "SFO status = " + localSfoField(result, "status", "unavailable")
     "modulation = " + cfg.MMod + "-QAM"
     "nominal bandwidth = " + cfg.signalBandwidthHz + " Hz"
     "design bit rate = " + cfg.designBitRateBps + " bit/s"
@@ -41,4 +45,12 @@ report = struct();
 report.directory = string(runDirectory);
 report.matFile = string(fullfile(runDirectory, "otfs_tr_result.mat"));
 report.textFile = string(reportPath);
+end
+
+function value = localSfoField(result, name, defaultValue)
+if isfield(result, "sfoInfo") && isfield(result.sfoInfo, name)
+    value = result.sfoInfo.(name);
+else
+    value = defaultValue;
+end
 end

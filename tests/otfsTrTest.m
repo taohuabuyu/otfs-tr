@@ -30,10 +30,11 @@ classdef otfsTrTest < matlab.unittest.TestCase
 
             actual = cfg.designSpectralEfficiency;
 
-            testCase.verifyEqual(actual, 2, AbsTol=1e-12);
+            testCase.verifyEqual(actual, log2(cfg.MMod), AbsTol=1e-12);
             testCase.verifyGreaterThanOrEqual(actual, ...
                 cfg.minimumSpectralEfficiency);
-            testCase.verifyEqual(cfg.designBitRateBps, 20e6, AbsTol=1e-6);
+            testCase.verifyEqual(cfg.designBitRateBps, ...
+                cfg.fsTx*log2(cfg.MMod), AbsTol=1e-6);
             testCase.verifyEqual(cfg.txTransportDataType, "int16");
             testCase.verifyEqual(cfg.rxTransportDataType, "int16");
             testCase.verifyEqual(cfg.txTransportPayloadRateBps, 320e6);
@@ -54,7 +55,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 expectedBitsPerFrame);
             testCase.verifyEqual(numel(txSignal), expectedBurstLength);
             testCase.verifyEqual(numel(training.preamble10), cfg.preambleLen);
-            testCase.verifyEqual(params.MMod, 4);
+            testCase.verifyEqual(params.MMod, cfg.MMod);
             testCase.verifyLessThanOrEqual(reference.actualTxPeak, ...
                 cfg.hardwareTxPeak + 1e-12);
         end

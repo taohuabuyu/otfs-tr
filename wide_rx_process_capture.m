@@ -3,7 +3,8 @@ function results = wide_rx_process_capture(rx20, training, params, refBits, p)
 %
 % RX route:
 %   20 MHz samples -> preamble coarse sync and large-CFO estimate
-%   -> 20 MHz CFO compensation -> low-pass filtering -> decimate to 10 MHz
+%   -> 20 MHz CFO compensation -> SFO correction -> low-pass filtering
+%   -> decimate to 10 MHz
 %   -> CP fine sync -> per-frame OTFS demodulation -> DD-pilot channel estimate
 %   -> MP detection / equalization -> QAM demodulation -> BER.
 
@@ -26,15 +27,19 @@ nRx = (0:numel(rx20)-1).';
 cfoEstimateHz = sync20.cfoEstimateHz;
 rx20CfoCorrected = rx20 .* exp(-1j*2*pi*cfoEstimateHz/p.fsRx*nRx);
 
+%% 20 MHz domain: estimate frame-spacing drift and correct SFO.
+[rx20SfoCorrected, sfoInfo] = otfs_tr_correct_sfo( ...
+    rx20CfoCorrected, training.preamble10, params, p);
+
 %% 20 MHz domain: optional low-pass filtering before returning to 10 MHz.
 % In this project the transmitted OTFS waveform already occupies the 10 MHz
 % processing bandwidth. Keep this switch visible so hardware captures can be
 % compared with and without FIR filtering; excessive filtering can distort the
 % edge subcarriers and raise BER.
 if localGetField(p, "enableRxLowpassFilter", false)
-    rx20Filtered = localLowpassBeforeDecimation(rx20CfoCorrected, ratio);
+    rx20Filtered = localLowpassBeforeDecimation(rx20SfoCorrected, ratio);
 else
-    rx20Filtered = rx20CfoCorrected;
+    rx20Filtered = rx20SfoCorrected;
 end
 
 %% 10 MHz domain: decimate using the phase implied by 20 MHz coarse sync.
@@ -83,9 +88,15 @@ results.attemptedFrames = maxFrames;
 results.payloadStarts10 = payloadStarts;
 results.rx20 = rx20;
 results.rx20CfoCorrected = rx20CfoCorrected;
+if sfoInfo.applied
+    results.rx20SfoCorrected = rx20SfoCorrected;
+else
+    results.rx20SfoCorrected = complex(zeros(0, 1));
+end
 results.rx20Filtered = rx20Filtered;
 results.rx10 = rx10;
 results.coarseSync20 = sync20;
+results.sfoInfo = sfoInfo;
 results.frameInfo = frameInfo;
 results.frameDiagnostics = frameDiagnostics;
 if isempty(frameInfo)

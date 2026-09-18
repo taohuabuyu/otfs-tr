@@ -7,9 +7,9 @@ USRP发射与接收拆到两台X310和两个MATLAB会话中。
 
 ## 设计目标
 
-- QPSK，10 MS/s 发射复基带采样率；
+- 8-QAM，10 MS/s 发射复基带采样率；
 - 名义信号带宽 10 MHz；
-- 不计同步、CP、导频和保护区开销的设计频谱效率为 2 bit/s/Hz；
+- 不计同步、CP、导频和保护区开销的设计频谱效率为 3 bit/s/Hz；
 - 使用两台独立 X310，默认验证 ±600 kHz 等效多普勒/载波频偏；
 - 实测 BER 小于 `1e-5` 才判定通过。
 
@@ -17,8 +17,8 @@ USRP发射与接收拆到两台X310和两个MATLAB会话中。
 板载内存连续循环播放。每帧包含63样点前导、64样点CP和单导频保护区，不在循环
 缓冲区之间插入静默。RX一次采集0.05秒原始IQ，
 采集期间不执行同步、绘图或磁盘写入。离线处理从整个窗口寻找所有前导。解调
-帧数根据调制阶数、BER目标和接收窗口自动计算；默认QPSK最多解调245帧，至少
-需要222个有效帧（300,588 bit）才能满足零误码时的95%上界要求。
+帧数根据调制阶数、BER目标和接收窗口自动计算；默认8-QAM最多解调163帧，至少
+需要148个有效帧（300,588 bit）才能满足零误码时的95%上界要求。
 TX持续发射阶段不再由主机实时推送IQ，因此避免USB网卡TX sequence error破坏连续
 波形。RX通过`basebandReceiver`先把固定窗口采入X310板载内存，采集完成后再下载
 到主机，避免20 MS/s实时网口拉流造成丢包或overrun；MATLAB内部处理为浮点，
@@ -36,6 +36,7 @@ TX/RX射频采样率为10/20 MS/s。
 | `run_otfs_tr_offline_decode.m` | 离线读取TX参考与RX采集，计算BER并判定 |
 | `otfs_tr_prepare_pair.m` | 建立本轮RX任务包及TX参考文件投放目录 |
 | `otfs_tr_find_latest_pair.m` | 查找最新且同时包含TX/RX文件的完整任务包 |
+| `otfs_tr_correct_sfo.m` | 从连续前导估计采样频偏并校正整段20 MHz IQ |
 | `run_otfs_tr_link.m` | 离线对比的兼容别名，不操作射频硬件 |
 | `run_otfs_tr_offline_test.m` | 无硬件的 ±600 kHz 基带链路测试 |
 | `run_all_tests.m` | 工程测试入口 |
@@ -124,22 +125,25 @@ TX脚本只构造发射对象，RX脚本只构造接收对象。BER不会在采�
 设计频谱效率：
 
 ```text
-R_design = fsTx * log2(MMod) = 10 MS/s * 2 = 20 Mbit/s
-eta_design = R_design / B_nominal = 20 Mbit/s / 10 MHz = 2 bit/s/Hz
+R_design = fsTx * log2(MMod) = 10 MS/s * 3 = 30 Mbit/s
+eta_design = R_design / B_nominal = 30 Mbit/s / 10 MHz = 3 bit/s/Hz
 ```
 
 BER 使用导频保护区以外的真实数据比特统计。零误码时同时要求95%上限
-`3/Nbits < 1e-5`；默认最低比较位数为300,001 bit，对应至少222个完整QPSK
+`3/Nbits < 1e-5`；默认最低比较位数为300,001 bit，对应至少148个完整8-QAM
 有效帧。`minimumValidFrames`与`maxDecodedFrames`均由配置自动推导。
 
 ## 已知边界
 
 - 默认验收环境为受控、高SNR、静态链路；复杂时变无线多径不是本工程的首要验收环境。
 - 10 MHz 是名义设计带宽；99% 实际占用带宽需要单独通过频谱分析验证。
-- 当前QPSK设计频谱效率为2 bit/s/Hz；若验收仍要求严格大于2，必须使用至少8-QAM，
-  不能把当前QPSK结果描述为满足原频谱效率目标。
+- 当前8-QAM设计频谱效率为3 bit/s/Hz，满足大于2 bit/s/Hz的设计指标；实机BER
+  是否达标仍必须由本轮硬件采集单独证明。
 - 实机结果仍取决于衰减、增益、端口、时钟、削顶、欠载和过载状态。
 - 当前接收算法与原工程一致，使用单导频DD信道估计和MP检测，没有替换为简化单抽头算法。
 - `run_all_tests`和`run_otfs_tr_offline_test`属于非硬件验证，不能替代两台X310实测报告。
 - 软件仿真、静态检查和无overrun/underrun的代码路径不能代替真实双X310采集证据。
 - 两台独立X310若不共享10 MHz参考，仍可能存在采样时钟偏差；必要时需要外部参考或SFO跟踪。
+- 默认开启软件SFO补偿。它根据整段采集中多个前导的分数位置拟合实际帧间隔，
+  再把20 MHz IQ重采样到名义帧间隔。可设置`cfg.enableSfoCompensation=false`
+  恢复原始处理路径；软件补偿不能替代对高质量共同10 MHz参考的硬件验证。
