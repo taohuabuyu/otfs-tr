@@ -25,7 +25,9 @@
 %    - Latest version of this code may be downloaded from: https://ecse.monash.edu/staff/eviterbo/
 %    - Freely distributed for educational and research purposes
 %%
-function x_est = OTFS_MP_Detection(N,M,M_mod,taps,delay_taps,Doppler_taps,chan_coef,sigma_2,y)
+function [x_est, x_soft, decision_confidence, x_observation] = ...
+    OTFS_MP_Detection( ...
+    N,M,M_mod,taps,delay_taps,Doppler_taps,chan_coef,sigma_2,y)
 
 yv = reshape(y,N*M,1);
 n_ite = 200;
@@ -35,6 +37,7 @@ alphabet = qammod(0:M_mod-1,M_mod,'gray','UnitAveragePower',true);
 mean_int = zeros(N*M,taps);
 var_int = zeros(N*M,taps);
 p_map = ones(N*M,taps,M_mod)*(1/M_mod);
+ln_qi = zeros(1,M_mod);
 
 conv_rate_prev = -0.1;
 for ite=1:n_ite
@@ -141,10 +144,52 @@ for ite=1:n_ite
     end
 end
 x_est = zeros(N,M);
+x_soft = complex(zeros(N,M));
+decision_confidence = zeros(N,M);
+x_observation = complex(zeros(N,M));
 for ele1=1:1:M
     for ele2=1:1:N
-        [~,pos] = max(sum_prob_fin(N*(ele1-1)+ele2,:));
+        probabilities = sum_prob_fin(N*(ele1-1)+ele2,:);
+        [decision_confidence(ele2,ele1),pos] = max(probabilities);
         x_est(ele2,ele1) = alphabet(pos);
+        x_soft(ele2,ele1) = probabilities * alphabet(:);
+
+        weightedObservation = 0;
+        totalWeight = 0;
+        for tap_no=1:taps
+            if ele1+delay_taps(tap_no)<=M
+                eff_ele1 = ele1 + delay_taps(tap_no);
+                add_term = exp(1i*2*(pi/M)*(ele1-1)* ...
+                    (Doppler_taps(tap_no)/N));
+                int_flag = 0;
+            else
+                eff_ele1 = ele1 + delay_taps(tap_no)-M;
+                add_term = exp(1i*2*(pi/M)*(ele1-1-M)* ...
+                    (Doppler_taps(tap_no)/N));
+                int_flag = 1;
+            end
+            add_term1 = 1;
+            if int_flag==1
+                add_term1 = exp(-1i*2*pi*((ele2-1)/N));
+            end
+            eff_ele2 = mod(ele2-1+Doppler_taps(tap_no),N)+1;
+            new_chan = add_term*add_term1*chan_coef(tap_no);
+            outputIndex = N*(eff_ele1-1)+eff_ele2;
+            if abs(new_chan)>eps
+                observation = (yv(outputIndex)- ...
+                    mean_int(outputIndex,tap_no))/new_chan;
+                observationVariance = max( ...
+                    var_int(outputIndex,tap_no), eps);
+                weight = abs(new_chan)^2/observationVariance;
+                weightedObservation = weightedObservation+weight*observation;
+                totalWeight = totalWeight+weight;
+            end
+        end
+        if totalWeight>0
+            x_observation(ele2,ele1) = weightedObservation/totalWeight;
+        else
+            x_observation(ele2,ele1) = x_soft(ele2,ele1);
+        end
     end
 end
 end

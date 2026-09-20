@@ -13,12 +13,13 @@ USRP发射与接收拆到两台X310和两个MATLAB会话中。
 - 使用两台独立 X310，默认验证 ±600 kHz 等效多普勒/载波频偏；
 - 实测 BER 小于 `1e-5` 才判定通过。
 
-默认TX预生成约0.1秒的连续帧缓冲区，并通过`basebandTransmitter`上传到X310的
-板载内存连续循环播放。每帧包含63样点前导、64样点CP和单导频保护区，不在循环
-缓冲区之间插入静默。RX一次采集0.05秒原始IQ，
+默认TX预生成由1024个唯一帧组成的超帧，并通过`basebandTransmitter`上传到X310的
+板载内存连续循环播放。每帧包含63样点前导、64样点CP、单导频保护区，以及受
+三重重复码和CRC-8保护的10 bit帧号，不在循环
+缓冲区之间插入静默。RX一次采集0.08秒原始IQ，
 采集期间不执行同步、绘图或磁盘写入。离线处理从整个窗口寻找所有前导。解调
-帧数根据调制阶数、BER目标和接收窗口自动计算；默认8-QAM最多解调163帧，至少
-需要148个有效帧（300,588 bit）才能满足零误码时的95%上界要求。
+帧数根据调制阶数、单次100万bit目标和接收窗口自动计算；QPSK、8-QAM和16-QAM
+分别最多解调848、557和416帧，并在单次采集中统计约110万唯一净荷比特。
 TX持续发射阶段不再由主机实时推送IQ，因此避免USB网卡TX sequence error破坏连续
 波形。RX通过`basebandReceiver`先把固定窗口采入X310板载内存，采集完成后再下载
 到主机，避免20 MS/s实时网口拉流造成丢包或overrun；MATLAB内部处理为浮点，
@@ -41,7 +42,9 @@ TX/RX射频采样率为10/20 MS/s。
 | `run_otfs_tr_offline_test.m` | 无硬件的 ±600 kHz 基带链路测试 |
 | `run_all_tests.m` | 工程测试入口 |
 | `otfs_tr_build_waveform.m` | 构建连续可配置QAM OTFS TX缓冲区与参考比特 |
-| `wide_rx_process_capture.m` | 分级CFO校正、全窗口前导搜索和OTFS接收主链路 |
+| `otfs_tr_encode_frame_header.m` / `otfs_tr_decode_frame_header.m` | 帧号、重复码和CRC-8映射/识别 |
+| `wide_rx_process_capture.m` | 分级CFO/SFO校正、DD导频辅助分数采样相位校正、全窗口前导搜索和OTFS接收主链路 |
+| `wide_rx_plot_diagnostics.m` | 保存幅度、同步、分数采样相位扫描、BER、连续均衡星座、逐帧EVM/相位和bit位错误图 |
 | `channel_estimation_for_ZF.m` / `OTFS_MP_Detection.m` | 原工程DD信道估计和MP检测 |
 | `otfs_tr_save_report.m` | 保存 MAT/文本验收结果 |
 | `OTFS_modulation.m` / `OTFS_demodulation.m` | OTFS 变换 |
@@ -115,8 +118,25 @@ TX脚本只构造发射对象，RX脚本只构造接收对象。BER不会在采�
 对比阶段才读取TX参考比特和RX原始IQ。只有离线结果中的
 `result.acceptance.pass=true`才表示本组数据满足全部验收条件。
 
-默认TX把约0.1秒的预生成缓冲区一次上传到X310板载内存，然后由硬件连续回放；
-持续发射期间不需要主机实时供数。RX使用一次固定长度调用接收1,000,000个20 MHz
+离线解码会在本次报告目录的`diagnostic_plots`子目录自动保存PNG和可编辑FIG。
+文本报告同时记录连续均衡符号EVM、去除公共复增益后的残余EVM、MP判决置信度、
+公共幅相残差以及各QAM bit位的错误数。这些指标只增强接收诊断，不改变硬判决、
+BER计算或发射波形。
+
+默认还会扫描`cfg.fractionalTimingSearchSamples10`，先用已知DD导频集中度确定
+分数采样相位的粗略范围，再用已知前导相关峰在局部细化；整个选择过程不读取
+payload参考比特。达到`cfg.fractionalTimingMinImprovementRatio`后，接收机在20 MHz
+IQ上执行PCHIP分数延迟校正并重新同步。可设置
+`cfg.enableFractionalTimingCompensation=false`恢复原始接收路径，发射端无需修改。
+
+接收端还提供三项默认开启、可独立关闭的稳健化处理：CP频偏估计异常时使用
+DD导频做小范围残余CFO兜底；首次MP检测后动态寻找具有一致公共复偏置的
+Doppler行并校正；最后以消偏后的判决残差估计有效噪声方差，必要时重新运行
+MP检测。对应开关为`enableDdPilotResidualCfoFallback`、
+`enableStructuredRowBiasCorrection`和`enableMpNoiseVarianceCalibration`。
+
+默认TX把约0.09秒的预生成缓冲区一次上传到X310板载内存，然后由硬件连续回放；
+持续发射期间不需要主机实时供数。RX使用一次固定长度调用接收1,600,000个20 MHz
 样点到X310板载内存，采集结束后再下载并保存。这种设计从架构上消除TX主机欠载，
 并避免RX采集窗口内的网卡吞吐和MATLAB/磁盘调度造成overrun。
 
@@ -129,9 +149,13 @@ R_design = fsTx * log2(MMod) = 10 MS/s * 3 = 30 Mbit/s
 eta_design = R_design / B_nominal = 30 Mbit/s / 10 MHz = 3 bit/s/Hz
 ```
 
-BER 使用导频保护区以外的真实数据比特统计。零误码时同时要求95%上限
-`3/Nbits < 1e-5`；默认最低比较位数为300,001 bit，对应至少148个完整8-QAM
-有效帧。`minimumValidFrames`与`maxDecodedFrames`均由配置自动推导。
+BER 只统计导频保护区和帧头以外的唯一净荷比特。接收端先解出帧号，再从
+`reference_package.mat`选择该帧对应的参考净荷，因此采集可以从超帧任意位置开始，
+重复帧号不会被重复计入BER。零误码时同时要求95%上限`3/Nbits < 1e-5`；默认最低
+比较位数为1,000,000 bit。QPSK、8-QAM和16-QAM分别至少需要770、506和378个
+完整有效帧。
+`headerSymbolsPerFrame`、`payloadBitsPerFrame`、`minimumValidFrames`与
+`maxDecodedFrames`均随调制阶数自动推导。
 
 ## 已知边界
 

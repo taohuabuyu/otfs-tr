@@ -71,7 +71,7 @@ classdef otfsTrSfoTest < matlab.unittest.TestCase
 
             processed = wide_rx_process_capture(distorted, ...
                 struct("preamble10", preamble10), params, ...
-                reference.bitsPerFrame, cfg);
+                reference, cfg);
             result = otfs_tr_finalize_result(processed, 600125, cfg);
 
             testCase.verifyTrue(result.sfoInfo.applied);
@@ -84,8 +84,11 @@ classdef otfsTrSfoTest < matlab.unittest.TestCase
     methods (Static, Access=private)
         function [rx20, preamble10, params, cfg] = createNominalCapture()
             cfg = otfs_tr_config();
+            cfg.superframeLength = 32;
             cfg.txBufferFrameCount = 32;
             cfg.txBurstLength = cfg.txBufferFrameCount*cfg.frameLength10;
+            cfg.totalUniquePayloadBits = cfg.superframeLength* ...
+                cfg.payloadBitsPerFrame;
             cfg.sfoMinimumPreambles = 12;
             [txSignal, ~, params, training] = ...
                 otfs_tr_build_waveform(cfg);

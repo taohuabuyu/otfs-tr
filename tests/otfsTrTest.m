@@ -8,12 +8,12 @@ classdef otfsTrTest < matlab.unittest.TestCase
             "positive600k", 600e3, ...
             "negative600k", -600e3)
         modulationCase = struct( ...
-            "qpsk", struct("order", 4, "bitsPerFrame", 1354, ...
-                "minimumFrames", 222, "decodedFrames", 245), ...
-            "qam8", struct("order", 8, "bitsPerFrame", 2031, ...
-                "minimumFrames", 148, "decodedFrames", 163), ...
-            "qam16", struct("order", 16, "bitsPerFrame", 2708, ...
-                "minimumFrames", 111, "decodedFrames", 123))
+            "qpsk", struct("order", 4, "bitsPerFrame", 1300, ...
+                "minimumFrames", 770, "decodedFrames", 848), ...
+            "qam8", struct("order", 8, "bitsPerFrame", 1977, ...
+                "minimumFrames", 506, "decodedFrames", 557), ...
+            "qam16", struct("order", 16, "bitsPerFrame", 2652, ...
+                "minimumFrames", 378, "decodedFrames", 416))
     end
 
     methods (TestClassSetup)
@@ -47,8 +47,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
             [txSignal, reference, params, training] = ...
                 otfs_tr_build_waveform(cfg);
 
-            expectedBitsPerFrame = (cfg.N*cfg.M - ...
-                (2*cfg.nMax+1)*(2*cfg.mMax+1))*cfg.MBits;
+            expectedBitsPerFrame = cfg.payloadSymbolsPerFrame*cfg.MBits;
             expectedFrameLength = cfg.preambleLen + cfg.cpLen + cfg.N*cfg.M;
             expectedBurstLength = cfg.txBufferFrameCount*expectedFrameLength;
             testCase.verifyEqual(reference.effectiveBitsPerFrame, ...
@@ -56,6 +55,10 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyEqual(numel(txSignal), expectedBurstLength);
             testCase.verifyEqual(numel(training.preamble10), cfg.preambleLen);
             testCase.verifyEqual(params.MMod, cfg.MMod);
+            testCase.verifyEqual(size(reference.payloadBitsByFrame), ...
+                [cfg.payloadBitsPerFrame cfg.superframeLength]);
+            testCase.verifyEqual(reference.referenceMode, ...
+                "unique-superframe");
             testCase.verifyLessThanOrEqual(reference.actualTxPeak, ...
                 cfg.hardwareTxPeak + 1e-12);
         end
@@ -84,6 +87,103 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyEqual(result.totalErrors, 0);
             testCase.verifyEqual(result.validFrames, cfg.maxDecodedFrames);
             testCase.verifyEqual(result.ber, 0, AbsTol=0);
+            testCase.verifyTrue(result.referenceAlignmentPass);
+            testCase.verifyTrue(isfinite(result.softEvmPercentMedian));
+            testCase.verifyLessThan(result.softEvmPercentMedian, 1e-3);
+            testCase.verifyGreaterThan(result.decisionConfidenceMedian, ...
+                0.99);
+            testCase.verifyEqual(result.bitErrorsByPlane, ...
+                zeros(1, cfg.MBits));
+            testCase.verifyEqual(result.ddPilotCfoFallbackFrames, 0);
+            testCase.verifyEqual(result.rowBiasCorrectedFrames, 0);
+            testCase.verifyEqual(result.mpNoiseCalibrationFrames, 0);
+            testCase.verifyTrue(isfinite(result.sigmaEffectiveMedian));
+        end
+
+        function testFractionalTimingRecoveryUsesKnownTraining(testCase)
+            cfg = otfsTrTest.fastConfiguration();
+            cfg.enableFractionalTimingCompensation = true;
+            cfg.fractionalTimingSearchSamples10 = -0.30:0.02:0.30;
+            cfg.fractionalTimingEstimationFrames = 4;
+            [txSignal, reference, params, training] = ...
+                otfs_tr_build_waveform(cfg);
+            rx20 = resample(txSignal, cfg.fsRx/cfg.fsTx, 1);
+            sampleIndex = (1:numel(rx20)).';
+            rx20 = interp1(sampleIndex, rx20, sampleIndex+0.36, ...
+                "pchip", 0);
+
+            processed = wide_rx_process_capture(rx20, training, params, ...
+                reference, cfg);
+            result = otfs_tr_finalize_result(processed, 0, cfg);
+
+            testCase.verifyTrue(result.fractionalTimingInfo.applied);
+            testCase.verifyEqual( ...
+                result.fractionalTimingInfo.selectedOffsetSamples10, ...
+                -0.18, AbsTol=0.06);
+            testCase.verifyGreaterThan( ...
+                result.fractionalTimingInfo.improvementRatio, 1.01);
+            testCase.verifyEqual(result.totalErrors, 0);
+        end
+
+        function testStructuredRowBiasCorrectionReducesInjectedDc(testCase)
+            cfg = otfsTrTest.fastConfiguration(8);
+            [txSignal, reference, params, training] = ...
+                otfs_tr_build_waveform(cfg);
+            txSignal = otfsTrTest.addPayloadOffset( ...
+                txSignal, cfg, 0.02+0.02i);
+            rx20 = resample(txSignal, cfg.fsRx/cfg.fsTx, 1);
+            disabledCfg = cfg;
+            disabledCfg.enableStructuredRowBiasCorrection = false;
+            disabledCfg.enableMpNoiseVarianceCalibration = false;
+
+            baseline = otfs_tr_finalize_result( ...
+                wide_rx_process_capture(rx20, training, params, ...
+                reference, disabledCfg), 0, disabledCfg);
+            corrected = otfs_tr_finalize_result( ...
+                wide_rx_process_capture(rx20, training, params, ...
+                reference, cfg), 0, cfg);
+
+            testCase.verifyGreaterThan(baseline.totalErrors, 0);
+            testCase.verifyLessThan(corrected.totalErrors, ...
+                baseline.totalErrors);
+            testCase.verifyGreaterThan(corrected.rowBiasCorrectedFrames, 0);
+            testCase.verifyEqual(find( ...
+                corrected.rowBiasApplicationCountByRow > 0), 1);
+        end
+
+        function testFrameHeaderRoundTrip(testCase, modulationCase)
+            cfg = otfs_tr_config(modulationCase.order);
+            frameId = cfg.superframeLength-1;
+
+            mappedBits = otfs_tr_encode_frame_header(frameId, cfg);
+            [actualId, valid] = otfs_tr_decode_frame_header(mappedBits, cfg);
+
+            testCase.verifyTrue(valid);
+            testCase.verifyEqual(actualId, frameId);
+            testCase.verifyEqual(numel(mappedBits), cfg.headerMappedBits);
+        end
+
+        function testFrameHeaderCorrectsOneRepeatedBit(testCase)
+            cfg = otfs_tr_config(8);
+            mappedBits = otfs_tr_encode_frame_header(137, cfg);
+            mappedBits(2) = ~mappedBits(2);
+
+            [actualId, valid] = otfs_tr_decode_frame_header(mappedBits, cfg);
+
+            testCase.verifyTrue(valid);
+            testCase.verifyEqual(actualId, 137);
+        end
+
+        function testSuperframeHasEnoughUniqueBits(testCase, modulationCase)
+            cfg = otfs_tr_config(modulationCase.order);
+
+            testCase.verifyGreaterThanOrEqual( ...
+                cfg.totalUniquePayloadBits, cfg.minimumTestBits);
+            testCase.verifyGreaterThanOrEqual( ...
+                cfg.maxDecodedFrames*cfg.payloadBitsPerFrame, ...
+                cfg.targetTestBits);
+            testCase.verifyLessThanOrEqual( ...
+                cfg.maxDecodedFrames, cfg.superframeLength);
         end
 
         function testRejectsNonIntegerSampleRateRatio(testCase)
@@ -234,6 +334,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyEqual(result.totalErrors, 0);
             testCase.verifyEqual(result.validFrames, cfg.maxDecodedFrames);
             testCase.verifyEqual(result.cfoEstimateHz, 600e3, AbsTol=100);
+            testCase.verifyTrue(all(isfile(result.diagnosticPlotFiles)));
         end
 
         function testSavedPairDirectoryOfflineDecode(testCase)
@@ -259,6 +360,24 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 pair.reportDirectory));
         end
 
+        function testRejectsMismatchedWaveformVersions(testCase)
+            cfg = otfsTrTest.fastConfiguration();
+            tempRoot = string(tempname);
+            mkdir(tempRoot);
+            testCase.addTeardown(@() rmdir(tempRoot, "s"));
+            [referenceFile, captureFile] = ...
+                otfsTrTest.createSavedPair(cfg, tempRoot, 600e3);
+            capture = load(captureFile);
+            capture.cfg.waveformVersion = 1;
+            save(captureFile, "-struct", "capture");
+
+            operation = @() run_otfs_tr_offline_decode( ...
+                referenceFile, captureFile);
+
+            testCase.verifyError(operation, ...
+                "otfs_tr:IncompatibleTxRxConfiguration");
+        end
+
         function testArbitraryWindowFindsRepeatedFrames(testCase)
             cfg = otfsTrTest.fastConfiguration();
             [txSignal, reference, params, training] = ...
@@ -269,7 +388,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
             rx20 = rx20 .* exp(1j*2*pi*600125/cfg.fsRx*n);
 
             processed = wide_rx_process_capture(rx20, training, params, ...
-                reference.bitsPerFrame, cfg);
+                reference, cfg);
             result = otfs_tr_finalize_result(processed, 600125, cfg);
 
             testCase.verifyEqual(result.validFrames, cfg.maxDecodedFrames);
@@ -278,12 +397,22 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 abs(result.cfoEstimateHz-600125), 250);
             testCase.verifyGreaterThan(result.detectedPreambles, ...
                 cfg.maxDecodedFrames);
+            testCase.verifyTrue(result.referenceAlignmentPass);
+            validIds = result.frameIds(isfinite(result.frameIds));
+            testCase.verifyEqual(mod(diff(validIds), cfg.superframeLength), ...
+                ones(numel(validIds)-1, 1));
         end
     end
 
     methods (Static, Access=private)
-        function cfg = fastConfiguration()
-            cfg = otfs_tr_config();
+        function cfg = fastConfiguration(modulationOrder)
+            if nargin < 1
+                cfg = otfs_tr_config();
+            else
+                cfg = otfs_tr_config(modulationOrder);
+            end
+            cfg.enableFractionalTimingCompensation = false;
+            cfg.superframeLength = 8;
             cfg.txBufferFrameCount = 8;
             cfg.txBurstLength = cfg.txBufferFrameCount*cfg.frameLength10;
             cfg.maxDecodedFrames = 6;
@@ -294,6 +423,8 @@ classdef otfsTrTest < matlab.unittest.TestCase
             cfg.frameResidualCfoSearchHz = -1000:100:1000;
             cfg.minimumTestBits = 1;
             cfg.minimumValidFrames = 1;
+            cfg.totalUniquePayloadBits = cfg.superframeLength* ...
+                cfg.payloadBitsPerFrame;
         end
 
 
@@ -320,6 +451,18 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 "reference", "txStatus");
             save(captureFile, "cfg", "rx20", "radioStatus", ...
                 "equivalentDopplerHz");
+        end
+
+
+        function txSignal = addPayloadOffset(txSignal, cfg, offset)
+            frameLength = cfg.frameLength10;
+            for frameIndex = 1:cfg.txBufferFrameCount
+                firstPayloadSample = (frameIndex-1)*frameLength + ...
+                    cfg.preambleLen+1;
+                lastPayloadSample = frameIndex*frameLength;
+                txSignal(firstPayloadSample:lastPayloadSample) = ...
+                    txSignal(firstPayloadSample:lastPayloadSample)+offset;
+            end
         end
     end
 end

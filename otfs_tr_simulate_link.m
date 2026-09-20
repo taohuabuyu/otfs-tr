@@ -24,7 +24,7 @@ if isfinite(snrDb)
 end
 
 processed = wide_rx_process_capture(rx20, training, params, ...
-    reference.bitsPerFrame, cfg);
+    reference, cfg);
 result = otfs_tr_finalize_result(processed, cfoHz, cfg);
 result.snrDb = snrDb;
 result.acceptance = otfs_tr_evaluate_acceptance(cfg, result, struct());

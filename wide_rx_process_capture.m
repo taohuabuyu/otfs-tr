@@ -1,10 +1,11 @@
-function results = wide_rx_process_capture(rx20, training, params, refBits, p)
+function results = wide_rx_process_capture(rx20, training, params, referenceInput, p)
 %wide_rx_process_capture Process one 20 MHz SDR capture through the OTFS RX chain.
 %
 % RX route:
 %   20 MHz samples -> preamble coarse sync and large-CFO estimate
 %   -> 20 MHz CFO compensation -> SFO correction -> low-pass filtering
-%   -> decimate to 10 MHz
+%   -> provisional 10 MHz decimation -> DD-pilot fractional timing estimate
+%   -> correct the 20 MHz IQ -> final 10 MHz decimation
 %   -> CP fine sync -> per-frame OTFS demodulation -> DD-pilot channel estimate
 %   -> MP detection / equalization -> QAM demodulation -> BER.
 
@@ -12,6 +13,7 @@ rx20 = rx20(:);
 params.channelTapThresholdRatio = localGetField( ...
     p, "channelTapThresholdRatio", 0.95);
 params.maxChannelTaps = localGetField(p, "maxChannelTaps", Inf);
+reference = localNormalizeReference(referenceInput);
 ratio = p.fsRx / p.fsTx;
 if abs(ratio - round(ratio)) > 1e-12
     error("wide_rx_process_capture:InvalidRateRatio", ...
@@ -46,7 +48,22 @@ end
 forcedPhase = mod(sync20.preambleStart20 - 1, ratio) + 1;
 rx10 = rx20Filtered(forcedPhase:ratio:end);
 
-%% 10 MHz domain: search the full capture for every complete frame.
+%% Estimate residual fractional timing from known DD pilots only.
+[provisionalPayloadStarts, provisionalFrameInfo, ~] = ...
+    localFineSyncOtfsFramesAt10Mhz( ...
+    rx10, training.preamble10, forcedPhase, params, p);
+fractionalTimingInfo = localEstimateFractionalTiming( ...
+    rx10, provisionalPayloadStarts, provisionalFrameInfo, ...
+    training.preamble10, params, p);
+if fractionalTimingInfo.applied
+    rx20FractionalTimingCorrected = localFractionalShift( ...
+        rx20Filtered, ratio*fractionalTimingInfo.selectedOffsetSamples10);
+    rx10 = rx20FractionalTimingCorrected(forcedPhase:ratio:end);
+else
+    rx20FractionalTimingCorrected = complex(zeros(0, 1));
+end
+
+%% 10 MHz domain: search the corrected capture for every complete frame.
 [payloadStarts, frameInfo, detectedPreambleCount] = ...
     localFineSyncOtfsFramesAt10Mhz( ...
     rx10, training.preamble10, forcedPhase, params, p);
@@ -58,8 +75,13 @@ end
 maxFrames = min(localGetField(p, "maxDecodedFrames", Inf), ...
     numel(payloadStarts));
 ber = nan(maxFrames, 1);
-frameDiagnostics = repmat(localEmptyFrameDiagnostics(params, refBits), ...
+frameDiagnostics = repmat(localEmptyFrameDiagnostics(params), ...
     maxFrames, 1);
+seenFrameIds = false(max(1, reference.superframeLength), 1);
+previousFrameId = NaN;
+headerCrcFailures = 0;
+duplicateFrameIds = 0;
+sequenceDiscontinuities = 0;
 for frameIdx = 1:maxFrames
     frameStart = payloadStarts(frameIdx);
     frameEnd = frameStart + params.blockLen - 1;
@@ -70,8 +92,37 @@ for frameIdx = 1:maxFrames
     rxBlock = rx10(frameStart:frameEnd);
     rxBlock = localApplyPreambleAndCpCorrections( ...
         rxBlock, frameInfo(frameIdx), p);
+    frameSettings = p;
+    fallbackApplied = localShouldUseDdPilotCfoFallback( ...
+        frameInfo(frameIdx), p);
+    if fallbackApplied
+        frameSettings.frameResidualCfoSearchHz = localGetField( ...
+            p, "ddPilotResidualCfoSearchHz", -3000:100:3000);
+    end
+    frameSettings.ddPilotResidualCfoFallbackApplied = fallbackApplied;
     [ber(frameIdx), frameDiagnostics(frameIdx)] = ...
-        localDetectOtfsFrameAndMeasureBer(rxBlock, params, refBits, p);
+        localDetectOtfsFrameAndMeasureBer( ...
+        rxBlock, params, reference, frameSettings);
+    if reference.mode == "unique-superframe"
+        if ~frameDiagnostics(frameIdx).headerValid
+            headerCrcFailures = headerCrcFailures + 1;
+            continue;
+        end
+        frameId = frameDiagnostics(frameIdx).frameId;
+        if seenFrameIds(frameId+1)
+            frameDiagnostics(frameIdx).duplicateFrameId = true;
+            duplicateFrameIds = duplicateFrameIds + 1;
+            ber(frameIdx) = NaN;
+            continue;
+        end
+        seenFrameIds(frameId+1) = true;
+        if isfinite(previousFrameId) && ...
+                frameId ~= mod(previousFrameId+1, reference.superframeLength)
+            frameDiagnostics(frameIdx).sequenceDiscontinuity = true;
+            sequenceDiscontinuities = sequenceDiscontinuities + 1;
+        end
+        previousFrameId = frameId;
+    end
 end
 
 %% Return both final BER and intermediate signals needed for diagnosis plots.
@@ -94,17 +145,137 @@ else
     results.rx20SfoCorrected = complex(zeros(0, 1));
 end
 results.rx20Filtered = rx20Filtered;
+results.rx20FractionalTimingCorrected = rx20FractionalTimingCorrected;
 results.rx10 = rx10;
 results.coarseSync20 = sync20;
 results.sfoInfo = sfoInfo;
+results.fractionalTimingInfo = fractionalTimingInfo;
 results.frameInfo = frameInfo;
 results.frameDiagnostics = frameDiagnostics;
+results.referenceMode = reference.mode;
+results.frameIds = [frameDiagnostics.frameId].';
+results.headerCrcFailures = headerCrcFailures;
+results.duplicateFrameIds = duplicateFrameIds;
+results.sequenceDiscontinuities = sequenceDiscontinuities;
+results.referenceAlignmentPass = reference.mode == "legacy-repeated" || ...
+    (headerCrcFailures == 0 && duplicateFrameIds == 0 && ...
+    sequenceDiscontinuities == 0 && any(isfinite(ber)));
 if isempty(frameInfo)
     results.syncInfo = struct();
 else
     results.syncInfo = frameInfo(1);
 end
 results.cfoEstimateHz = cfoEstimateHz;
+end
+
+function useFallback = localShouldUseDdPilotCfoFallback(frameInfo, p)
+useFallback = false;
+if ~localGetField(p, "enableDdPilotResidualCfoFallback", false)
+    return;
+end
+triggerHz = localGetField(p, "ddPilotResidualCfoTriggerHz", 500);
+cpRejected = isfield(frameInfo, "cpCorrectionAccepted") && ...
+    ~frameInfo.cpCorrectionAccepted;
+cpNearZeroButPreambleIsNot = abs(frameInfo.cpCfoEstimateHz) < triggerHz && ...
+    abs(frameInfo.preambleResidualCfoHz) >= triggerHz;
+useFallback = cpRejected || cpNearZeroButPreambleIsNot;
+end
+
+function info = localEstimateFractionalTiming( ...
+        rx10, payloadStarts, frameInfo, preamble10, params, p)
+% Select a sub-sample phase from the known DD pilot, then refine it locally
+% with the known preamble. Neither score uses payload reference bits.
+searchGrid = localGetField(p, "fractionalTimingSearchSamples10", 0);
+searchGrid = searchGrid(:);
+info = struct("enabled", localGetField( ...
+    p, "enableFractionalTimingCompensation", false), ...
+    "applied", false, "status", "disabled", ...
+    "searchGridSamples10", searchGrid, ...
+    "concentrationScores", nan(size(searchGrid)), ...
+    "preambleScores", nan(size(searchGrid)), ...
+    "pilotSelectedOffsetSamples10", 0, ...
+    "selectedOffsetSamples10", 0, "baselineScore", NaN, ...
+    "bestScore", NaN, "improvementRatio", NaN, ...
+    "estimationFrames", 0);
+if ~info.enabled
+    return;
+end
+if isempty(payloadStarts)
+    info.status = "no-complete-frames";
+    return;
+end
+
+frameLimit = min(numel(payloadStarts), localGetField( ...
+    p, "fractionalTimingEstimationFrames", 20));
+scoreMatrix = nan(frameLimit, numel(searchGrid));
+preambleScoreMatrix = nan(frameLimit, numel(searchGrid));
+preamble10 = preamble10(:);
+preambleEnergy = sum(abs(preamble10).^2);
+for gridIndex = 1:numel(searchGrid)
+    candidateRx10 = localFractionalShift(rx10, searchGrid(gridIndex));
+    for frameIndex = 1:frameLimit
+        firstSample = payloadStarts(frameIndex);
+        lastSample = firstSample + params.blockLen - 1;
+        if firstSample < 1 || lastSample > numel(candidateRx10)
+            continue;
+        end
+        candidateBlock = candidateRx10(firstSample:lastSample);
+        rxData = candidateBlock(params.LCp+1:end);
+        rxGrid = OTFS_demodulation(params.N, params.M, rxData);
+        scoreMatrix(frameIndex, gridIndex) = ...
+            localPilotConcentrationScore(rxGrid, params);
+        preambleStart = frameInfo(frameIndex).preambleStart10;
+        preambleEnd = preambleStart + numel(preamble10) - 1;
+        if preambleStart >= 1 && preambleEnd <= numel(candidateRx10)
+            candidatePreamble = candidateRx10(preambleStart:preambleEnd);
+            preambleScoreMatrix(frameIndex, gridIndex) = ...
+                abs(preamble10' * candidatePreamble)^2 / ...
+                (preambleEnergy*sum(abs(candidatePreamble).^2) + eps);
+        end
+    end
+end
+info.concentrationScores = median(scoreMatrix, 1, "omitnan").';
+info.preambleScores = median(preambleScoreMatrix, 1, "omitnan").';
+info.estimationFrames = sum(any(isfinite(scoreMatrix), 2));
+zeroIndex = find(abs(searchGrid) < 10*eps, 1, "first");
+info.baselineScore = info.concentrationScores(zeroIndex);
+[info.bestScore, bestIndex] = max(info.concentrationScores);
+if ~isfinite(info.bestScore) || ~isfinite(info.baselineScore)
+    info.status = "insufficient-pilot-observations";
+    return;
+end
+info.pilotSelectedOffsetSamples10 = searchGrid(bestIndex);
+info.improvementRatio = info.bestScore / max(info.baselineScore, eps);
+refineRadius = 0.03;
+refineMask = abs(searchGrid-info.pilotSelectedOffsetSamples10) <= ...
+    refineRadius + 10*eps & isfinite(info.preambleScores);
+refineIndices = find(refineMask);
+if isempty(refineIndices)
+    selectedIndex = bestIndex;
+else
+    [~, localIndex] = max(info.preambleScores(refineIndices));
+    selectedIndex = refineIndices(localIndex);
+end
+info.selectedOffsetSamples10 = searchGrid(selectedIndex);
+minimumRatio = localGetField(p, ...
+    "fractionalTimingMinImprovementRatio", 1.01);
+if abs(info.selectedOffsetSamples10) < 10*eps
+    info.status = "zero-offset-selected";
+elseif info.improvementRatio < minimumRatio
+    info.status = "improvement-below-threshold";
+    info.selectedOffsetSamples10 = 0;
+else
+    info.applied = true;
+    info.status = "applied";
+end
+end
+
+function shifted = localFractionalShift(signal, offsetSamples)
+% PCHIP avoids the strong passband distortion seen with the optional LPF.
+signal = signal(:);
+sampleIndex = (1:numel(signal)).';
+shifted = interp1(sampleIndex, signal, sampleIndex + offsetSamples, ...
+    "pchip", 0);
 end
 
 function sync20 = localCoarseSyncAndCfoAt20Mhz(rx20, preamble10, p)
@@ -279,7 +450,8 @@ for idx = 1:numel(preambleStarts)
     end
 
     coarsePayloadStart = preEnd + 1;
-    [payloadStart, cpScore, cpCfoHz] = localFineSyncWithOtfsCp( ...
+    [payloadStart, cpScore, cpCfoHz, cpCorrectionAccepted] = ...
+        localFineSyncWithOtfsCp( ...
         rx10, coarsePayloadStart, params, p);
 
     info = localEmptyFrameInfo();
@@ -293,6 +465,7 @@ for idx = 1:numel(preambleStarts)
     info.cpTimingScore = cpScore;
     info.preambleResidualCfoHz = residualCfoHz;
     info.cpCfoEstimateHz = cpCfoHz;
+    info.cpCorrectionAccepted = cpCorrectionAccepted;
     if p.applyCpCfoCorrection
         info.cpCfoHz = cpCfoHz;
     else
@@ -320,7 +493,8 @@ for index = 1:numel(candidateIdx)
 end
 end
 
-function [payloadStart, bestScore, cfoHz] = localFineSyncWithOtfsCp( ...
+function [payloadStart, bestScore, cfoHz, correctionAccepted] = ...
+        localFineSyncWithOtfsCp( ...
         rx10, coarseStart, params, p)
 % The CP repeats the end of the OTFS block, so CP/tail correlation refines timing.
 searchStart = max(1, coarseStart - p.cpFineSearchRadius);
@@ -329,6 +503,7 @@ searchEnd = min(numel(rx10) - params.blockLen + 1, ...
 payloadStart = coarseStart;
 bestScore = NaN;
 cfoHz = 0;
+correctionAccepted = false;
 if searchEnd < searchStart
     return;
 end
@@ -361,6 +536,7 @@ if ~acceptFineStart
     cfoHz = 0;
 else
     cfoHz = angle(bestCorr) * p.fsTx / (2*pi*params.Nfft);
+    correctionAccepted = true;
 end
 end
 
@@ -384,14 +560,21 @@ end
 end
 
 function [ber, diag] = localDetectOtfsFrameAndMeasureBer( ...
-        rxBlock, params, refBits, p)
+        rxBlock, params, reference, p)
 % OTFS demodulation -> DD-pilot channel estimate -> MP detection -> BER.
-diag = localEmptyFrameDiagnostics(params, refBits);
+diag = localEmptyFrameDiagnostics(params);
 [rxBlock, frameResidualCfoHz, frameResidualCfoScore] = ...
     localRefineResidualCfoWithDdPilot(rxBlock, params, p);
 diag.frameResidualCfoHz = frameResidualCfoHz;
 diag.frameResidualCfoScore = frameResidualCfoScore;
+diag.ddPilotResidualCfoFallbackApplied = localGetField( ...
+    p, "ddPilotResidualCfoFallbackApplied", false);
 rxData = rxBlock(params.LCp+1:end);
+diag.frameDcEstimate = mean(rxData);
+if localGetField(p, "enablePerFrameDcRemoval", false)
+    rxData = rxData-diag.frameDcEstimate;
+    diag.frameDcRemovalApplied = true;
+end
 rxGrid = OTFS_demodulation(params.N, params.M, rxData);
 diag.rxGrid = rxGrid;
 
@@ -428,28 +611,207 @@ diag.tapsUsed = taps;
 
 % MP detection uses the estimated DD-domain sparse channel to recover symbols.
 sigmaEst = max(sigmaEst, 1e-8);
-xEst = OTFS_MP_Detection(params.N, params.M, params.MMod, taps, ...
+[xEst, xPosteriorMean, decisionConfidence, xObservation] = ...
+    OTFS_MP_Detection( ...
+    params.N, params.M, params.MMod, taps, ...
     delayTaps, dopplerTaps, chanCoef, sigmaEst, rxGrid);
 xEst = reshape(xEst, params.N, params.M);
+xPosteriorMean = reshape(xPosteriorMean, params.N, params.M);
+xObservation = reshape(xObservation, params.N, params.M);
+decisionConfidence = reshape(decisionConfidence, params.N, params.M);
+[xObservationCorrected, xEstCorrected, rowBiasInfo] = ...
+    localCorrectStructuredRowBias(xObservation, xEst, params, p);
+[sigmaEffective, noiseInfo] = localCalibrateMpNoiseVariance( ...
+    xObservationCorrected, xEstCorrected, chanCoef, sigmaEst, params, p);
+if noiseInfo.applied
+    [xEst, xPosteriorMean, decisionConfidence, xObservation] = ...
+        OTFS_MP_Detection( ...
+        params.N, params.M, params.MMod, taps, ...
+        delayTaps, dopplerTaps, chanCoef, sigmaEffective, rxGrid);
+    xEst = reshape(xEst, params.N, params.M);
+    xPosteriorMean = reshape(xPosteriorMean, params.N, params.M);
+    xObservation = reshape(xObservation, params.N, params.M);
+    decisionConfidence = reshape(decisionConfidence, params.N, params.M);
+    [xObservationCorrected, xEstCorrected, rowBiasInfo] = ...
+        localCorrectStructuredRowBias(xObservation, xEst, params, p);
+end
+xObservationRaw = xObservation;
+xObservation = xObservationCorrected;
+xEst = xEstCorrected;
 dataSymbols = xEst(params.dataMask == 1);
+posteriorMeanDataSymbols = xPosteriorMean(params.dataMask == 1);
+softDataSymbols = xObservation(params.dataMask == 1);
+dataDecisionConfidence = decisionConfidence(params.dataMask == 1);
 diag.detectedGrid = xEst;
+diag.posteriorMeanGrid = xPosteriorMean;
+diag.softDetectedGrid = xObservation;
+diag.rawSoftDetectedGrid = xObservationRaw;
+diag.rowBiasCorrectionApplied = rowBiasInfo.applied;
+diag.rowBiasAppliedRows = rowBiasInfo.appliedRows;
+diag.rowBiasByRow = rowBiasInfo.biasByRow;
+diag.rowBiasImprovementRatioByRow = rowBiasInfo.improvementRatioByRow;
+diag.rowBiasCoherenceByRow = rowBiasInfo.coherenceByRow;
+diag.sigmaEffective = sigmaEffective;
+diag.mpNoiseCalibrationApplied = noiseInfo.applied;
+diag.mpNoiseCalibrationRatio = noiseInfo.ratio;
+diag.decisionDirectedSigmaEqualized = noiseInfo.equalizedVariance;
 diag.dataSymbols = dataSymbols;
+diag.softDataSymbols = softDataSymbols;
+diag.posteriorMeanDataSymbols = posteriorMeanDataSymbols;
+diag.dataDecisionConfidence = dataDecisionConfidence;
+diag.meanDecisionConfidence = mean(dataDecisionConfidence, "omitnan");
+diag.minimumDecisionConfidence = min(dataDecisionConfidence, [], "omitnan");
 
 if isfield(params, "dataScale") && params.dataScale ~= 0 && ...
         params.dataScale ~= 1
     dataSymbols = dataSymbols / params.dataScale;
+    softDataSymbols = softDataSymbols / params.dataScale;
 end
+
 demapped = qamdemod(dataSymbols, params.MMod, "gray", ...
     "UnitAveragePower", true);
-estimatedBits = reshape(de2bi(demapped, params.MBits), [], 1);
+demappedRows = de2bi(demapped, params.MBits);
+if reference.mode == "unique-superframe"
+    if ~isfield(params, "headerSymbolsPerFrame") || ...
+            size(demappedRows, 1) <= params.headerSymbolsPerFrame
+        ber = NaN;
+        return;
+    end
+    headerBits = reshape(demappedRows( ...
+        1:params.headerSymbolsPerFrame, :), [], 1);
+    [frameId, headerValid, headerInformationBits] = ...
+        otfs_tr_decode_frame_header(headerBits, params);
+    diag.frameId = frameId;
+    diag.headerValid = headerValid;
+    diag.headerEstimatedBits = headerBits;
+    diag.headerInformationBits = headerInformationBits;
+    if ~headerValid
+        ber = NaN;
+        return;
+    end
+    estimatedBits = reshape(demappedRows( ...
+        params.headerSymbolsPerFrame+1:end, :), [], 1);
+    refBits = reference.payloadBitsByFrame(:, frameId+1);
+    expectedHeaderBits = otfs_tr_encode_frame_header(frameId, params);
+    expectedHeaderRows = reshape(expectedHeaderBits, ...
+        params.headerSymbolsPerFrame, params.MBits);
+    expectedPayloadRows = reshape(refBits, [], params.MBits);
+    expectedRows = [expectedHeaderRows; expectedPayloadRows];
+    expectedSymbols = qammod(bi2de(expectedRows), params.MMod, ...
+        "gray", "UnitAveragePower", true);
+    diag = localAddSoftSymbolDiagnostics(diag, softDataSymbols, ...
+        expectedSymbols);
+else
+    estimatedBits = reshape(demappedRows, [], 1);
+    refBits = reference.bitsPerFrame;
+    diag.headerValid = true;
+end
 compareLen = min(numel(estimatedBits), numel(refBits));
-bitErrors = xor(estimatedBits(1:compareLen), refBits(1:compareLen));
+if compareLen < 1
+    ber = NaN;
+    return;
+end
+bitErrors = xor(logical(estimatedBits(1:compareLen)), ...
+    logical(refBits(1:compareLen)));
 ber = sum(bitErrors) / compareLen;
 
 diag.estimatedBits = estimatedBits(1:compareLen);
 diag.refBits = refBits(1:compareLen);
 diag.bitErrors = bitErrors;
 diag.errorBitPositions = find(bitErrors);
+bitErrorRows = reshape(bitErrors, [], params.MBits);
+diag.bitErrorsByPlane = sum(bitErrorRows, 1);
+end
+
+function [observationCorrected, hardCorrected, info] = ...
+        localCorrectStructuredRowBias(observation, hardDecision, params, p)
+observationCorrected = observation;
+hardCorrected = hardDecision;
+info = struct("applied", false, "appliedRows", zeros(0, 1), ...
+    "biasByRow", complex(zeros(params.N, 1)), ...
+    "improvementRatioByRow", ones(params.N, 1), ...
+    "coherenceByRow", zeros(params.N, 1));
+if ~localGetField(p, "enableStructuredRowBiasCorrection", false)
+    return;
+end
+
+alphabet = qammod((0:params.MMod-1).', params.MMod, "gray", ...
+    "UnitAveragePower", true);
+dataScale = localGetField(params, "dataScale", 1);
+alphabet = dataScale*alphabet;
+iterations = localGetField(p, "rowBiasIterations", 5);
+minimumMagnitude = localGetField(p, "rowBiasMinMagnitude", 0.10);
+maximumMagnitude = localGetField(p, "rowBiasMaxMagnitude", 0.75);
+minimumImprovement = localGetField(p, ...
+    "rowBiasMinImprovementRatio", 1.25);
+minimumCoherence = localGetField(p, "rowBiasMinCoherence", 0.65);
+
+for row = 1:params.N
+    dataColumns = find(params.dataMask(row, :) == 1);
+    if numel(dataColumns) < 4
+        continue;
+    end
+    values = observation(row, dataColumns).';
+    bias = 0;
+    for iteration = 1:iterations
+        decisions = localNearestAlphabet(values-bias, alphabet);
+        bias = mean(values-decisions);
+    end
+    decisionsBefore = localNearestAlphabet(values, alphabet);
+    decisionsAfter = localNearestAlphabet(values-bias, alphabet);
+    distanceBefore = sum(abs(values-decisionsBefore).^2);
+    distanceAfter = sum(abs(values-bias-decisionsAfter).^2);
+    residuals = values-decisionsAfter;
+    improvement = distanceBefore/max(distanceAfter, eps);
+    coherence = abs(mean(residuals))/(mean(abs(residuals))+eps);
+    info.biasByRow(row) = bias;
+    info.improvementRatioByRow(row) = improvement;
+    info.coherenceByRow(row) = coherence;
+    shouldApply = abs(bias) >= minimumMagnitude && ...
+        abs(bias) <= maximumMagnitude && ...
+        improvement >= minimumImprovement && ...
+        coherence >= minimumCoherence;
+    if shouldApply
+        observationCorrected(row, :) = observation(row, :)-bias;
+        hardCorrected(row, dataColumns) = decisionsAfter.';
+        info.appliedRows(end+1, 1) = row;
+    end
+end
+info.applied = ~isempty(info.appliedRows);
+end
+
+function decisions = localNearestAlphabet(values, alphabet)
+[~, indices] = min(abs(values-alphabet.').^2, [], 2);
+decisions = alphabet(indices);
+end
+
+function [sigmaEffective, info] = localCalibrateMpNoiseVariance( ...
+        observation, hardDecision, chanCoef, sigmaOriginal, params, p)
+info = struct("applied", false, "ratio", 1, ...
+    "equalizedVariance", NaN, "candidateVariance", sigmaOriginal);
+sigmaEffective = sigmaOriginal;
+if ~localGetField(p, "enableMpNoiseVarianceCalibration", false)
+    return;
+end
+mask = params.dataMask == 1;
+residual = observation(mask)-hardDecision(mask);
+if isempty(residual) || ~any(isfinite(residual))
+    return;
+end
+% For circular complex Gaussian noise, |w|^2 is exponential and its mean
+% equals median(|w|^2)/log(2). This also captures unmodelled residual energy.
+equalizedVariance = median(abs(residual).^2, "omitnan")/log(2);
+channelPower = sum(abs(chanCoef).^2);
+candidateVariance = max(equalizedVariance*channelPower, 1e-8);
+ratio = candidateVariance/max(sigmaOriginal, 1e-8);
+info.equalizedVariance = equalizedVariance;
+info.candidateVariance = candidateVariance;
+info.ratio = ratio;
+minimumRatio = localGetField(p, "mpNoiseCalibrationMinRatio", 1.25);
+if isfinite(candidateVariance) && ratio >= minimumRatio
+    sigmaEffective = candidateVariance;
+    info.applied = true;
+end
 end
 
 function [rxBlockBest, bestCfoHz, bestScore] = ...
@@ -496,10 +858,13 @@ guardEnergy = sum(abs(guard(:)).^2);
 score = pilotPeak / (guardEnergy + eps);
 end
 
-function diag = localEmptyFrameDiagnostics(params, refBits)
+function diag = localEmptyFrameDiagnostics(params)
 diag = struct();
 diag.rxGrid = complex(nan(params.N, params.M));
 diag.detectedGrid = complex(nan(params.N, params.M));
+diag.softDetectedGrid = complex(nan(params.N, params.M));
+diag.rawSoftDetectedGrid = complex(nan(params.N, params.M));
+diag.posteriorMeanGrid = complex(nan(params.N, params.M));
 diag.pilotRx = NaN;
 diag.phaseCorrectionRad = NaN;
 diag.delayTaps = [];
@@ -508,16 +873,97 @@ diag.chanCoef = [];
 diag.taps = 0;
 diag.tapsUsed = 0;
 diag.sigmaEst = NaN;
+diag.sigmaEffective = NaN;
+diag.mpNoiseCalibrationApplied = false;
+diag.mpNoiseCalibrationRatio = NaN;
+diag.decisionDirectedSigmaEqualized = NaN;
 diag.delayTapsUsed = [];
 diag.dopplerTapsUsed = [];
 diag.chanCoefUsed = [];
 diag.dataSymbols = complex(zeros(0, 1));
+diag.softDataSymbols = complex(zeros(0, 1));
+diag.posteriorMeanDataSymbols = complex(zeros(0, 1));
+diag.expectedDataSymbols = complex(zeros(0, 1));
+diag.dataDecisionConfidence = zeros(0, 1);
+diag.meanDecisionConfidence = NaN;
+diag.minimumDecisionConfidence = NaN;
+diag.softEvmRms = NaN;
+diag.softEvmPercent = NaN;
+diag.residualEvmRms = NaN;
+diag.residualEvmPercent = NaN;
+diag.commonComplexGain = NaN;
+diag.commonGainMagnitude = NaN;
+diag.commonPhaseErrorRad = NaN;
 diag.estimatedBits = zeros(0, 1);
-diag.refBits = refBits(:);
-diag.bitErrors = false(numel(refBits), 1);
+diag.refBits = zeros(0, 1);
+diag.bitErrors = false(0, 1);
 diag.errorBitPositions = zeros(0, 1);
 diag.frameResidualCfoHz = 0;
 diag.frameResidualCfoScore = NaN;
+diag.ddPilotResidualCfoFallbackApplied = false;
+diag.rowBiasCorrectionApplied = false;
+diag.rowBiasAppliedRows = zeros(0, 1);
+diag.rowBiasByRow = complex(zeros(params.N, 1));
+diag.rowBiasImprovementRatioByRow = ones(params.N, 1);
+diag.rowBiasCoherenceByRow = zeros(params.N, 1);
+diag.frameDcEstimate = NaN;
+diag.frameDcRemovalApplied = false;
+diag.frameId = NaN;
+diag.headerValid = false;
+diag.headerEstimatedBits = zeros(0, 1);
+diag.headerInformationBits = zeros(0, 1);
+diag.duplicateFrameId = false;
+diag.sequenceDiscontinuity = false;
+diag.bitErrorsByPlane = zeros(1, params.MBits);
+end
+
+function diag = localAddSoftSymbolDiagnostics(diag, softSymbols, expectedSymbols)
+softSymbols = softSymbols(:);
+expectedSymbols = expectedSymbols(:);
+compareLength = min(numel(softSymbols), numel(expectedSymbols));
+if compareLength < 1
+    return;
+end
+softSymbols = softSymbols(1:compareLength);
+expectedSymbols = expectedSymbols(1:compareLength);
+referenceEnergy = sum(abs(expectedSymbols).^2);
+if referenceEnergy <= eps
+    return;
+end
+
+commonGain = (expectedSymbols' * softSymbols) / referenceEnergy;
+softError = softSymbols-expectedSymbols;
+residualError = softSymbols-commonGain*expectedSymbols;
+fittedEnergy = sum(abs(commonGain*expectedSymbols).^2);
+diag.softDataSymbols = softSymbols;
+diag.expectedDataSymbols = expectedSymbols;
+diag.softEvmRms = sqrt(sum(abs(softError).^2)/referenceEnergy);
+diag.softEvmPercent = 100*diag.softEvmRms;
+diag.residualEvmRms = sqrt(sum(abs(residualError).^2) / ...
+    max(fittedEnergy, eps));
+diag.residualEvmPercent = 100*diag.residualEvmRms;
+diag.commonComplexGain = commonGain;
+diag.commonGainMagnitude = abs(commonGain);
+diag.commonPhaseErrorRad = angle(commonGain);
+end
+
+function reference = localNormalizeReference(referenceInput)
+% Accept both current superframe packages and legacy repeated-frame bits.
+reference = struct();
+if isstruct(referenceInput) && ...
+        isfield(referenceInput, "payloadBitsByFrame")
+    reference.mode = "unique-superframe";
+    reference.payloadBitsByFrame = referenceInput.payloadBitsByFrame;
+    reference.superframeLength = size(reference.payloadBitsByFrame, 2);
+elseif isstruct(referenceInput) && isfield(referenceInput, "bitsPerFrame")
+    reference.mode = "legacy-repeated";
+    reference.bitsPerFrame = referenceInput.bitsPerFrame(:);
+    reference.superframeLength = 1;
+else
+    reference.mode = "legacy-repeated";
+    reference.bitsPerFrame = referenceInput(:);
+    reference.superframeLength = 1;
+end
 end
 
 function [delayTaps, dopplerTaps, chanCoef, taps] = localKeepStrongestTaps( ...
@@ -540,6 +986,7 @@ info = struct("preambleStart10", NaN, "trainStart10", NaN, ...
     "channelEstimate", 1, "phaseEstimateRad", NaN, ...
     "cpTimingScore", NaN, "preambleResidualCfoHz", 0, ...
     "cpCfoEstimateHz", 0, "cpCfoHz", 0, ...
+    "cpCorrectionAccepted", false, ...
     "cpFineOffset", NaN, "cfoEstimateHz", NaN, ...
     "residualCfoHz", 0, "cpAccepted", false);
 end

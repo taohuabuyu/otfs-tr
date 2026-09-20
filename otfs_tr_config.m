@@ -20,8 +20,8 @@ cfg.rxRadioConfiguration = "My USRP X310";
 cfg.txAntenna = "RFB:TX/RX";
 cfg.rxAntenna = "RFA:RX2";
 cfg.masterClockRate = 200e6;
-cfg.txCenterFrequencyHz = 2.675e9;
-cfg.equivalentDopplerHz = 600e3;
+cfg.txCenterFrequencyHz = 2.6756e9;
+cfg.equivalentDopplerHz = -600e3;
 cfg.txGainDb = 5;
 cfg.rxGainDb = 20;
 cfg.txChannelMapping = 2;
@@ -42,6 +42,7 @@ cfg.N = 32;
 cfg.M = 24;
 cfg.MMod = modulationOrder;
 cfg.MBits = log2(cfg.MMod);
+cfg.waveformVersion = 2;
 cfg.cpLen = 64;
 cfg.xPilot = 2 + 2i;
 cfg.mPilot = 12;
@@ -58,9 +59,13 @@ cfg.preambleRoot = 25;
 % silent gaps inside or between submitted buffers.
 cfg.zerosAheadLen = 0;
 cfg.zerosTailLen = 0;
-cfg.txBufferDurationSeconds = 0.10;
-cfg.rxCaptureDurationSeconds = 0.05;
+cfg.txBufferDurationSeconds = 0.09;
+cfg.rxCaptureDurationSeconds = 0.08;
 cfg.decodeFrameMarginRatio = 0.10;
+cfg.superframeLength = 1024;
+cfg.frameIdBits = 10;
+cfg.frameCrcBits = 8;
+cfg.headerRepetition = 3;
 cfg.targetTxRms = 0.20;
 cfg.targetPayloadTxRms = 0.20;
 cfg.hardwareTxPeak = 0.95;
@@ -79,10 +84,26 @@ cfg.sfoMinCorrectionPpm = 0.5;
 cfg.sfoMaxAbsPpm = 200;
 cfg.sfoPreambleMinScore = 0.35;
 cfg.enableRxLowpassFilter = false;
+cfg.enableFractionalTimingCompensation = true;
+cfg.fractionalTimingSearchSamples10 = -0.30:0.01:0.30;
+cfg.fractionalTimingEstimationFrames = 20;
+cfg.fractionalTimingMinImprovementRatio = 1.01;
+cfg.enablePerFrameDcRemoval = false;
 cfg.applyPreambleResidualCfoCorrection = false;
 cfg.channelTapThresholdRatio = 0.95;
 cfg.maxChannelTaps = Inf;
 cfg.frameResidualCfoSearchHz = 0;
+cfg.enableDdPilotResidualCfoFallback = true;
+cfg.ddPilotResidualCfoSearchHz = -3000:100:3000;
+cfg.ddPilotResidualCfoTriggerHz = 500;
+cfg.enableStructuredRowBiasCorrection = true;
+cfg.rowBiasIterations = 5;
+cfg.rowBiasMinMagnitude = 0.10;
+cfg.rowBiasMaxMagnitude = 0.75;
+cfg.rowBiasMinImprovementRatio = 1.25;
+cfg.rowBiasMinCoherence = 0.65;
+cfg.enableMpNoiseVarianceCalibration = true;
+cfg.mpNoiseCalibrationMinRatio = 1.25;
 cfg.cpFineSearchRadius = 32;
 cfg.cpFineMinScore = 0.65;
 cfg.cpFineRelativeMargin = 1.10;
@@ -95,6 +116,7 @@ cfg.maxGridPlots = 8;
 cfg.captureCallCount = 1;
 cfg.captureBurstCount = cfg.captureCallCount;
 cfg.maximumBer = 1e-5;
+cfg.targetTestBits = 1e6;
 cfg.minimumDopplerHz = 500e3;
 cfg.minimumSpectralEfficiency = 2;
 cfg.requireNoRadioErrors = true;
@@ -109,14 +131,29 @@ cfg.txTransportPayloadRateBps = cfg.fsTx * 2 * ...
 cfg.rxTransportPayloadRateBps = cfg.fsRx * 2 * ...
     otfs_tr_transport_bits(cfg.rxTransportDataType);
 cfg.frameLength10 = cfg.preambleLen + cfg.cpLen + cfg.N*cfg.M;
-cfg.txBufferFrameCount = ceil(cfg.txBufferDurationSeconds * ...
+desiredTxBufferFrames = ceil(cfg.txBufferDurationSeconds * ...
     cfg.fsTx / cfg.frameLength10);
+cfg.txBufferFrameCount = ceil(desiredTxBufferFrames / ...
+    cfg.superframeLength) * cfg.superframeLength;
 cfg.txBurstLength = cfg.txBufferFrameCount * cfg.frameLength10;
 cfg.rxSampleRateRatio = cfg.fsRx/cfg.fsTx;
 cfg.rxSamplesPerFrame = round(cfg.rxCaptureDurationSeconds * cfg.fsRx);
 guardSymbols = (2*cfg.nMax+1)*(2*cfg.mMax+1);
-cfg.effectiveBitsPerFrame = (cfg.N*cfg.M-guardSymbols)*cfg.MBits;
-cfg.minimumTestBits = floor(3/cfg.maximumBer) + 1;
+cfg.dataSymbolsPerFrame = cfg.N*cfg.M-guardSymbols;
+cfg.headerInformationBits = cfg.frameIdBits + cfg.frameCrcBits;
+cfg.headerCodedBits = cfg.headerInformationBits*cfg.headerRepetition;
+cfg.headerSymbolsPerFrame = ceil(cfg.headerCodedBits/cfg.MBits);
+cfg.headerMappedBits = cfg.headerSymbolsPerFrame*cfg.MBits;
+cfg.headerPaddingBits = cfg.headerMappedBits-cfg.headerCodedBits;
+cfg.payloadSymbolsPerFrame = cfg.dataSymbolsPerFrame - ...
+    cfg.headerSymbolsPerFrame;
+cfg.payloadBitsPerFrame = cfg.payloadSymbolsPerFrame*cfg.MBits;
+cfg.effectiveBitsPerFrame = cfg.payloadBitsPerFrame;
+cfg.totalUniquePayloadBits = cfg.superframeLength* ...
+    cfg.payloadBitsPerFrame;
+statisticalMinimumTestBits = floor(3/cfg.maximumBer) + 1;
+cfg.minimumTestBits = max(statisticalMinimumTestBits, ...
+    cfg.targetTestBits);
 cfg.minimumValidFrames = ceil(cfg.minimumTestBits / ...
     cfg.effectiveBitsPerFrame);
 cfg.availableCaptureFrames = floor( ...
@@ -124,8 +161,8 @@ cfg.availableCaptureFrames = floor( ...
     cfg.frameLength10) - 1;
 desiredDecodedFrames = ceil(cfg.minimumValidFrames * ...
     (1 + cfg.decodeFrameMarginRatio));
-cfg.maxDecodedFrames = min(desiredDecodedFrames, ...
-    cfg.availableCaptureFrames);
+cfg.maxDecodedFrames = min([desiredDecodedFrames, ...
+    cfg.availableCaptureFrames, cfg.superframeLength]);
 end
 
 function bitsPerComponent = otfs_tr_transport_bits(transportDataType)

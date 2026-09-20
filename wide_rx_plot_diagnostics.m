@@ -18,10 +18,41 @@ plotFiles = strings(0, 1);
 plotFiles = [plotFiles; localPlotRx20Amplitude(results, plotDir, opts)];
 plotFiles = [plotFiles; localPlotPreambleSync(results, plotDir, opts)];
 plotFiles = [plotFiles; localPlotRx10Amplitude(results, plotDir, opts)];
+plotFiles = [plotFiles; localPlotFractionalTiming(results, plotDir, opts)];
 plotFiles = [plotFiles; localPlotBer(results, plotDir, opts)];
 plotFiles = [plotFiles; localPlotErrorFrameGrid(results, params, plotDir, opts)];
 plotFiles = [plotFiles; localPlotErrorBitPositions(results, plotDir, opts)];
+plotFiles = [plotFiles; localPlotSoftConstellation(results, plotDir, opts)];
+plotFiles = [plotFiles; localPlotEvmAndPhase(results, plotDir, opts)];
+plotFiles = [plotFiles; localPlotBitPlaneErrors(results, plotDir, opts)];
 plotFiles = plotFiles(strlength(plotFiles) > 0);
+end
+
+function paths = localPlotFractionalTiming(results, plotDir, opts)
+fig = figure("Visible", opts.figureVisible, ...
+    "Name", "Fractional timing pilot scan");
+if ~isfield(results, "fractionalTimingInfo") || ...
+        isempty(results.fractionalTimingInfo.searchGridSamples10)
+    text(0.1, 0.5, "Fractional-timing diagnostics unavailable");
+    axis off;
+else
+    info = results.fractionalTimingInfo;
+    yyaxis left;
+    plot(info.searchGridSamples10, info.concentrationScores, ".-");
+    grid on;
+    xlabel("Fractional offset at 10 MHz (samples)");
+    ylabel("Median DD-pilot concentration");
+    if isfield(info, "preambleScores")
+        yyaxis right;
+        plot(info.searchGridSamples10, info.preambleScores, ".-");
+        ylabel("Median normalized preamble correlation");
+    end
+    title(sprintf("Fractional timing: %.3f sample, %s", ...
+        info.selectedOffsetSamples10, info.status));
+    xline(info.selectedOffsetSamples10, "r--", "Selected");
+end
+paths = localSaveFigure(fig, fullfile(plotDir, ...
+    "fractional_timing_pilot_scan"), opts);
 end
 
 function opts = localApplyPlotDefaults(opts)
@@ -144,6 +175,84 @@ else
     end
 end
 paths = localSaveFigure(fig, fullfile(plotDir, "error_bit_positions"), opts);
+end
+
+function paths = localPlotSoftConstellation(results, plotDir, opts)
+fig = figure("Visible", opts.figureVisible, ...
+    "Name", "Worst-frame equalized constellation");
+frameIdx = localWorstFrame(results);
+hasSoftSymbols = isfinite(frameIdx) && ...
+    isfield(results.frameDiagnostics, "softDataSymbols") && ...
+    ~isempty(results.frameDiagnostics(frameIdx).softDataSymbols) && ...
+    ~isempty(results.frameDiagnostics(frameIdx).expectedDataSymbols);
+if ~hasSoftSymbols
+    text(0.1, 0.5, "Soft-symbol diagnostics unavailable");
+    axis off;
+else
+    actual = results.frameDiagnostics(frameIdx).softDataSymbols;
+    expected = results.frameDiagnostics(frameIdx).expectedDataSymbols;
+    scatter(real(actual), imag(actual), 12, "filled", ...
+        "MarkerFaceAlpha", 0.35);
+    hold on;
+    plot(real(unique(expected)), imag(unique(expected)), "rx", ...
+        "MarkerSize", 11, "LineWidth", 2);
+    hold off;
+    axis equal;
+    grid on;
+    xlabel("In-phase");
+    ylabel("Quadrature");
+    title(sprintf("Equalized constellation, frame %d, EVM %.2f%%", ...
+        frameIdx, results.frameDiagnostics(frameIdx).softEvmPercent));
+    legend("Interference-cancelled observation", "Expected constellation", ...
+        "Location", "best");
+end
+paths = localSaveFigure(fig, fullfile(plotDir, ...
+    "equalized_constellation_worst_frame"), opts);
+end
+
+function paths = localPlotEvmAndPhase(results, plotDir, opts)
+fig = figure("Visible", opts.figureVisible, ...
+    "Name", "Frame EVM and common phase");
+frameCount = numel(results.frameDiagnostics);
+frameIndex = (1:frameCount).';
+evm = [results.frameDiagnostics.softEvmPercent].';
+residualEvm = [results.frameDiagnostics.residualEvmPercent].';
+phaseDegrees = rad2deg( ...
+    [results.frameDiagnostics.commonPhaseErrorRad].');
+tiledlayout(2, 1);
+nexttile;
+plot(frameIndex, evm, ".-", frameIndex, residualEvm, ".-");
+grid on;
+xlabel("Decoded frame index");
+ylabel("EVM (%)");
+legend("Equalized EVM", "After common-gain removal", "Location", "best");
+title("Per-frame equalized-symbol EVM");
+nexttile;
+plot(frameIndex, phaseDegrees, ".-");
+grid on;
+xlabel("Decoded frame index");
+ylabel("Phase error (deg)");
+title("Fitted common phase error");
+paths = localSaveFigure(fig, fullfile(plotDir, ...
+    "evm_and_common_phase_per_frame"), opts);
+end
+
+function paths = localPlotBitPlaneErrors(results, plotDir, opts)
+fig = figure("Visible", opts.figureVisible, "Name", "QAM bit-plane errors");
+if isfield(results, "bitErrorsByPlane")
+    values = results.bitErrorsByPlane;
+else
+    values = sum(vertcat( ...
+        results.frameDiagnostics.bitErrorsByPlane), 1);
+end
+bar(1:numel(values), values);
+grid on;
+xlabel("Bit position within QAM symbol");
+ylabel("Bit errors");
+title("Aggregate errors by QAM bit plane");
+xticks(1:numel(values));
+paths = localSaveFigure(fig, fullfile(plotDir, ...
+    "bit_errors_by_qam_plane"), opts);
 end
 
 function cfoEstimateHz = localCfoEstimate(results)
