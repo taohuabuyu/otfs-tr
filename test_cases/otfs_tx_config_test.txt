@@ -1,0 +1,8 @@
+# OTFS-TR TX software-control configuration test case.
+# Relative testPayload paths are resolved from this TXT directory.
+testPayload=CASE-OTFS-8QAM-001-airid.mat
+scenario=software_txt_path_integration_test
+freq_offset_hz=-600000
+targetBer=1e-5
+targetSpectralEfficiency=2
+duration_seconds=5

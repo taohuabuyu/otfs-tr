@@ -1,14 +1,16 @@
-function result = otfs_tr_simulate_link(cfg, cfoHz, snrDb)
+function result = otfs_tr_simulate_link(cfg, cfoHz, snrDb, applicationRequest)
 %otfs_tr_simulate_link Run a deterministic non-hardware flat-link simulation.
 
 arguments
     cfg (1,1) struct
     cfoHz (1,1) double
     snrDb (1,1) double = Inf
+    applicationRequest = []
 end
 
 otfs_tr_validate_config(cfg);
-[txSignal, reference, params, training] = otfs_tr_build_waveform(cfg);
+[txSignal, reference, params, training] = ...
+    otfs_tr_build_waveform(cfg, applicationRequest);
 ratio = round(cfg.fsRx/cfg.fsTx);
 rx20 = resample(txSignal, ratio, 1);
 rx20 = rx20(1:min(cfg.rxSamplesPerFrame, numel(rx20)));

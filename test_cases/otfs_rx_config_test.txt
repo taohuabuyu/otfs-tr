@@ -1,0 +1,3 @@
+# OTFS-TR RX software-control configuration test case.
+# RX currently accepts only the local reference test-case path.
+testPayload=CASE-OTFS-8QAM-001-airid.mat

@@ -1,0 +1,53 @@
+function testCase = otfs_tr_load_test_case(filePath, cfg)
+%otfs_tr_load_test_case Validate fixed per-frame payload bits from a MAT.
+% Contract: one scalar struct named test_case with version=1, case_id,
+% and payload_bits of size [bitsPerFrame, superframeLength].
+
+filePath = string(filePath);
+if ~isscalar(filePath) || strlength(filePath) == 0 || ...
+        ~isfile(filePath) || ~endsWith(lower(filePath), ".mat")
+    error("otfs_tr:InvalidTestCaseFile", ...
+        "A local MAT test-case file is required.");
+end
+fileInfo = dir(filePath);
+if fileInfo.bytes < 1 || fileInfo.bytes > 50*1024*1024
+    error("otfs_tr:InvalidTestCaseSize", ...
+        "The MAT test-case file must not exceed 50 MiB.");
+end
+variables = whos("-file", filePath);
+selected = variables(strcmp({variables.name}, "test_case"));
+if numel(selected) ~= 1 || ~strcmp(selected.class, "struct")
+    error("otfs_tr:InvalidTestCaseSchema", ...
+        "MAT file must contain one struct variable named test_case.");
+end
+loaded = load(filePath, "test_case");
+data = loaded.test_case;
+if ~isstruct(data) || ~isscalar(data) || ...
+        ~all(isfield(data, ["version", "case_id", "payload_bits"]))
+    error("otfs_tr:InvalidTestCaseSchema", ...
+        "test_case requires version, case_id, and payload_bits.");
+end
+if ~isnumeric(data.version) || ~isscalar(data.version) || ...
+        data.version ~= 1
+    error("otfs_tr:UnsupportedTestCaseVersion", ...
+        "test_case.version must equal 1.");
+end
+caseId = string(data.case_id);
+if ~isscalar(caseId) || isempty(regexp(caseId, ...
+        "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", "once"))
+    error("otfs_tr:InvalidTestCaseId", ...
+        "test_case.case_id must contain 1-64 safe characters.");
+end
+bits = data.payload_bits;
+expectedSize = [cfg.berTestBitsPerFrame cfg.superframeLength];
+if ~(isnumeric(bits) || islogical(bits)) || ~isreal(bits) || ...
+        ~isequal(size(bits), expectedSize) || ...
+        ~all(bits(:) == 0 | bits(:) == 1)
+    error("otfs_tr:InvalidTestCaseBits", ...
+        "test_case.payload_bits must be a %d-by-%d matrix of 0/1 bits.", ...
+        expectedSize(1), expectedSize(2));
+end
+testCase = struct("version", 1, "caseId", caseId, ...
+    "payloadBitsByFrame", double(bits), ...
+    "sourceFile", filePath);
+end

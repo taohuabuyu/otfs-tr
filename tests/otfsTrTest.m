@@ -10,8 +10,8 @@ classdef otfsTrTest < matlab.unittest.TestCase
         modulationCase = struct( ...
             "qpsk", struct("order", 4, "bitsPerFrame", 1300, ...
                 "minimumFrames", 770, "decodedFrames", 848), ...
-            "qam8", struct("order", 8, "bitsPerFrame", 1977, ...
-                "minimumFrames", 506, "decodedFrames", 557), ...
+            "qam8", struct("order", 8, "bitsPerFrame", 1608, ...
+                "minimumFrames", 622, "decodedFrames", 685), ...
             "qam16", struct("order", 16, "bitsPerFrame", 2652, ...
                 "minimumFrames", 378, "decodedFrames", 416))
     end
@@ -41,13 +41,38 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyEqual(cfg.rxTransportPayloadRateBps, 640e6);
         end
 
+        function testFixedRxCenterAndRequestedTxOffset(testCase, offsetCase)
+            cfg = otfs_tr_config();
+            fixedRxCenter = cfg.rxCenterFrequencyHz;
+
+            configured = otfs_tr_apply_equivalent_cfo(cfg, offsetCase);
+
+            testCase.verifyEqual(configured.rxCenterFrequencyHz, ...
+                fixedRxCenter, AbsTol=1e-6);
+            testCase.verifyEqual(configured.txCenterFrequencyHz, ...
+                fixedRxCenter-offsetCase, AbsTol=1e-6);
+            testCase.verifyEqual(configured.txCenterFrequencyHz- ...
+                configured.rxCenterFrequencyHz, -offsetCase, ...
+                AbsTol=1e-6);
+            testCase.verifyWarningFree( ...
+                @() otfs_tr_validate_config(configured));
+        end
+
+        function testRejectsInconsistentRfCenters(testCase)
+            cfg = otfs_tr_config();
+            cfg.txCenterFrequencyHz = cfg.txCenterFrequencyHz + 1e3;
+
+            testCase.verifyError(@() otfs_tr_validate_config(cfg), ...
+                "otfs_tr:InconsistentCenterFrequency");
+        end
+
         function testWaveformAndReferenceLengths(testCase)
             cfg = otfsTrTest.fastConfiguration();
 
             [txSignal, reference, params, training] = ...
                 otfs_tr_build_waveform(cfg);
 
-            expectedBitsPerFrame = cfg.payloadSymbolsPerFrame*cfg.MBits;
+            expectedBitsPerFrame = cfg.effectiveBitsPerFrame;
             expectedFrameLength = cfg.preambleLen + cfg.cpLen + cfg.N*cfg.M;
             expectedBurstLength = cfg.txBufferFrameCount*expectedFrameLength;
             testCase.verifyEqual(reference.effectiveBitsPerFrame, ...
@@ -57,6 +82,8 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyEqual(params.MMod, cfg.MMod);
             testCase.verifyEqual(size(reference.payloadBitsByFrame), ...
                 [cfg.payloadBitsPerFrame cfg.superframeLength]);
+            testCase.verifyEqual(size(reference.berTestBitsByFrame), ...
+                [cfg.berTestBitsPerFrame cfg.superframeLength]);
             testCase.verifyEqual(reference.referenceMode, ...
                 "unique-superframe");
             testCase.verifyLessThanOrEqual(reference.actualTxPeak, ...
@@ -180,7 +207,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyGreaterThanOrEqual( ...
                 cfg.totalUniquePayloadBits, cfg.minimumTestBits);
             testCase.verifyGreaterThanOrEqual( ...
-                cfg.maxDecodedFrames*cfg.payloadBitsPerFrame, ...
+                cfg.maxDecodedFrames*cfg.effectiveBitsPerFrame, ...
                 cfg.targetTestBits);
             testCase.verifyLessThanOrEqual( ...
                 cfg.maxDecodedFrames, cfg.superframeLength);
@@ -305,6 +332,22 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyTrue(acceptance.pass);
         end
 
+        function testUnknownRequestedCfoUsesBlindEstimate(testCase)
+            cfg = otfs_tr_config();
+            qualifiedBits = cfg.minimumValidFrames*cfg.effectiveBitsPerFrame;
+            result = struct("ber", 0, "totalBits", qualifiedBits, ...
+                "totalErrors", 0, "requestedDopplerHz", NaN, ...
+                "validFrames", cfg.minimumValidFrames, ...
+                "cfoEstimateHz", 600e3, "residualCfoHz", 0);
+
+            acceptance = otfs_tr_evaluate_acceptance(cfg, result);
+
+            testCase.verifyEqual(acceptance.dopplerSource, "estimated_cfo");
+            testCase.verifyEqual(acceptance.testedDopplerHz, ...
+                600e3, AbsTol=1e-6);
+            testCase.verifyTrue(acceptance.dopplerPass);
+        end
+
         function testHardwareEntriesAreSeparated(testCase)
             projectRoot = fileparts(fileparts(mfilename("fullpath")));
 
@@ -321,6 +364,24 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 "otfs_tr_process_capture"));
         end
 
+        function testRxSavesCaptureBeforePreparingLocalReference(testCase)
+            projectRoot = fileparts(fileparts(mfilename("fullpath")));
+            rxText = fileread(fullfile(projectRoot, ...
+                "run_otfs_tr_receiver.m"));
+
+            captureSavePosition = strfind(rxText, "save(captureFile");
+            configLoadPosition = strfind(rxText, ...
+                "otfs_tr_load_receiver_config(");
+            referencePosition = strfind(rxText, ...
+                "otfs_tr_prepare_local_reference(");
+
+            testCase.verifyNumElements(captureSavePosition, 1);
+            testCase.verifyNumElements(configLoadPosition, 1);
+            testCase.verifyNumElements(referencePosition, 1);
+            testCase.verifyLessThan(captureSavePosition, configLoadPosition);
+            testCase.verifyLessThan(captureSavePosition, referencePosition);
+        end
+
         function testSavedReferenceAndCaptureOfflineDecode(testCase)
             cfg = otfsTrTest.fastConfiguration();
             tempRoot = string(tempname);
@@ -334,7 +395,59 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyEqual(result.totalErrors, 0);
             testCase.verifyEqual(result.validFrames, cfg.maxDecodedFrames);
             testCase.verifyEqual(result.cfoEstimateHz, 600e3, AbsTol=100);
+            expectedReceiveDuration = numel(result.rx20)/cfg.fsRx;
+            expectedTransferRate = result.totalBits/expectedReceiveDuration;
+            testCase.verifyEqual(result.receiveDurationSeconds, ...
+                expectedReceiveDuration, AbsTol=1e-12);
+            testCase.verifyEqual(result.receivedBitsForRate, result.totalBits);
+            testCase.verifyEqual(result.transferRateBps, ...
+                expectedTransferRate, AbsTol=1e-6);
             testCase.verifyTrue(all(isfile(result.diagnosticPlotFiles)));
+            testCase.verifyTrue(isfile(result.report.responseFile));
+            testCase.verifyTrue(isfile(result.report.metricsResponseFile));
+            testCase.verifyTrue(isfile(result.report.artifactsResponseFile));
+            metricsResponse = jsondecode(fileread( ...
+                result.report.metricsResponseFile));
+            artifactsResponse = jsondecode(fileread( ...
+                result.report.artifactsResponseFile));
+            testCase.verifyEqual(string(metricsResponse.stage), ...
+                "metrics_completed");
+            testCase.verifyEqual(string(metricsResponse.status), ...
+                "processing");
+            testCase.verifyEqual( ...
+                metricsResponse.metrics.receive_duration_seconds, ...
+                expectedReceiveDuration, AbsTol=1e-12);
+            testCase.verifyEqual(metricsResponse.metrics.transfer_rate_bps, ...
+                expectedTransferRate, AbsTol=1e-6);
+            reportText = fileread(result.report.textFile);
+            testCase.verifyTrue(contains(reportText, ...
+                "received bits for transfer rate = "));
+            testCase.verifyTrue(contains(reportText, "transfer rate = "));
+            testCase.verifyFalse( ...
+                logical(metricsResponse.artifacts.result_mat_ready));
+            testCase.verifyEqual(string(artifactsResponse.stage), ...
+                "artifacts_completed");
+            testCase.verifyEqual(string(artifactsResponse.status), ...
+                "completed");
+            testCase.verifyTrue( ...
+                logical(artifactsResponse.artifacts.result_mat_ready));
+            testCase.verifyTrue(isfile(result.report.matFile));
+            archived = load(result.report.matFile, "result");
+            testCase.verifyEqual( ...
+                string(archived.result.diagnosticsStorage.mode), ...
+                "compact");
+            testCase.verifyFalse(isfield(archived.result, "rx20"));
+            testCase.verifyNotEmpty( ...
+                archived.result.frameDiagnostics(1).rxGrid);
+            testCase.verifyEmpty( ...
+                archived.result.frameDiagnostics(6).rxGrid);
+            testCase.verifyEqual(archived.result.totalErrors, 0);
+            testCase.verifyEqual(result.application.decodedText, "TEST");
+            testCase.verifyTrue(result.application.pass);
+            testCase.verifyEqual( ...
+                result.softwareResponse.artifacts.constellation_image_path, ...
+                result.diagnosticPlotFiles(contains( ...
+                result.diagnosticPlotFiles, "constellation_8qam.png")));
         end
 
         function testSavedPairDirectoryOfflineDecode(testCase)
@@ -358,6 +471,17 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyEqual(result.pairDirectory, pair.pairDirectory);
             testCase.verifyTrue(startsWith(result.report.directory, ...
                 pair.reportDirectory));
+            latestResponseFile = fullfile(pair.pairDirectory, ...
+                "response.json");
+            latestResponse = jsondecode(fileread(latestResponseFile));
+            manifest = load(pair.manifestFile, "pairManifest");
+            testCase.verifyEqual(string(latestResponse.stage), ...
+                "artifacts_completed");
+            testCase.verifyEqual(string( ...
+                manifest.pairManifest.processingStage), ...
+                "artifacts_completed");
+            testCase.verifyEqual(string(manifest.pairManifest.status), ...
+                "processed");
         end
 
         function testRejectsMismatchedWaveformVersions(testCase)
@@ -424,13 +548,16 @@ classdef otfsTrTest < matlab.unittest.TestCase
             cfg.minimumTestBits = 1;
             cfg.minimumValidFrames = 1;
             cfg.totalUniquePayloadBits = cfg.superframeLength* ...
-                cfg.payloadBitsPerFrame;
+                cfg.effectiveBitsPerFrame;
         end
 
 
         function [referenceFile, captureFile] = ...
                 createSavedPair(cfg, tempRoot, cfoHz)
             cfg.resultRoot = tempRoot;
+            % The simulated baseband offset is fTX-fRX, while the request
+            % convention is fRX-fTX.
+            cfg = otfs_tr_apply_equivalent_cfo(cfg, -cfoHz);
             [txSignal, reference, params, training] = ...
                 otfs_tr_build_waveform(cfg);
             ratio = cfg.fsRx/cfg.fsTx;
@@ -444,7 +571,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 "anyRxOverrun", false, ...
                 "captureComplete", true, ...
                 "totalReceivedSamples", numel(rx20));
-            equivalentDopplerHz = cfoHz;
+            equivalentDopplerHz = -cfoHz;
             referenceFile = fullfile(tempRoot, "reference_package.mat");
             captureFile = fullfile(tempRoot, "rx_capture.mat");
             save(referenceFile, "cfg", "params", "training", ...

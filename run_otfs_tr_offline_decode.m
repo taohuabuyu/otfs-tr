@@ -25,17 +25,69 @@ rx = load(captureFile);
 localValidatePair(tx, rx);
 cfg = tx.cfg;
 cfg = localApplyCurrentReceiverDefaults(cfg, defaultCfg);
-cfg.equivalentDopplerHz = rx.equivalentDopplerHz;
+requestedCfoKnown = localField(rx, "requestedCfoKnown", ...
+    isfinite(rx.equivalentDopplerHz));
+if requestedCfoKnown && isfinite(rx.equivalentDopplerHz)
+    requestedEquivalentCfoHz = double(rx.equivalentDopplerHz);
+else
+    requestedCfoKnown = false;
+    requestedEquivalentCfoHz = NaN;
+end
+if requestedCfoKnown
+    cfg = otfs_tr_apply_equivalent_cfo(cfg, requestedEquivalentCfoHz);
+else
+    % RX-local processing has no knowledge of the TX tuning. The zero value
+    % is only a self-consistent nominal reference; CFO recovery is blind.
+    cfg = otfs_tr_apply_equivalent_cfo(cfg, 0);
+end
 cfg.captureBurstCount = rx.radioStatus.captureCalls;
+if localField(cfg, "enableProgressReporting", false)
+    if strlength(pairDirectory) > 0
+        cfg.progressFile = string(fullfile(pairDirectory, "progress.json"));
+    elseif strlength(string(localField(cfg, "progressFile", ""))) == 0
+        progressRoot = fullfile(cfg.resultRoot, "progress");
+        progressName = "progress_" + string(datetime("now", ...
+            "Format", "yyyyMMdd_HHmmss_SSS")) + ".json";
+        cfg.progressFile = string(fullfile(progressRoot, progressName));
+    end
+end
 otfs_tr_validate_config(cfg);
 
 processed = wide_rx_process_capture(rx.rx20, tx.training, tx.params, ...
     tx.reference, cfg);
-result = otfs_tr_finalize_result(processed, rx.equivalentDopplerHz, cfg);
-result.actualBasebandOffsetHz = -rx.equivalentDopplerHz;
+if isfield(tx.reference, "testCase") && ...
+        processed.caseCodeMismatches > 0
+    error("otfs_tr:AirCaseCodeMismatch", ...
+        "Received air case code does not match the selected MAT case.");
+end
+result = otfs_tr_finalize_result(processed, requestedEquivalentCfoHz, cfg);
+result.requestedCfoKnown = requestedCfoKnown;
+if requestedCfoKnown
+    result.cfoAssessmentSource = "configured_cfo";
+    result.actualBasebandOffsetHz = -requestedEquivalentCfoHz;
+else
+    result.cfoAssessmentSource = "estimated_cfo";
+    result.actualBasebandOffsetHz = NaN;
+end
 result.referenceFile = string(referenceFile);
 result.captureFile = string(captureFile);
 result.pairDirectory = pairDirectory;
+result.localRunId = localRunId(pairDirectory);
+result.referenceOrigin = string(localField(tx, ...
+    "referenceOrigin", "tx-saved-reference"));
+result.transmitterStatusVerified = ...
+    result.referenceOrigin == "tx-saved-reference";
+result.txAwgnEvidenceAvailable = isfield(tx, "txAwgnInfo");
+if result.txAwgnEvidenceAvailable
+    result.txAwgn = tx.txAwgnInfo;
+end
+result.testCaseId = "";
+if isfield(tx.reference, "testCase")
+    result.testCaseId = string(tx.reference.testCase.caseId);
+    result.airCaseCode = uint32(tx.reference.testCase.caseCode);
+    result.airCaseCodeConfirmed = result.validFrames >= 2 && ...
+        result.caseCodeMismatches == 0;
+end
 
 radioStatus = rx.radioStatus;
 radioStatus.txRepeatStarted = tx.txStatus.started;
@@ -51,35 +103,125 @@ radioStatus.txOnboardReplayStopped = localField(tx.txStatus, ...
     "onboardReplayStopped", false);
 radioStatus.txNoApiError = localField(tx.txStatus, "noTxApiError", false);
 result.radioStatus = radioStatus;
+[result.transferRateBps, result.receiveDurationSeconds] = ...
+    otfs_tr_calculate_transfer_rate(result.totalBits, radioStatus, cfg.fsRx);
+result.receivedBitsForRate = result.totalBits;
 result.acceptance = otfs_tr_evaluate_acceptance(cfg, result, radioStatus);
+result.acceptance.coreMetricsPass = result.acceptance.pass;
+result.acceptance.applicationPass = result.application.pass;
+result.overallPass = result.acceptance.coreMetricsPass && ...
+    result.acceptance.applicationPass;
 reportRoot = cfg.resultRoot;
 if strlength(pairDirectory) > 0
     reportRoot = fullfile(pairDirectory, "reports");
 end
 result.report = otfs_tr_save_report(cfg, result, radioStatus, reportRoot);
-plotDirectory = fullfile(result.report.directory, "diagnostic_plots");
-plotOptions = struct("showFigures", false, "closeFigures", true);
-result.diagnosticPlotFiles = wide_rx_plot_diagnostics( ...
-    result, tx.params, plotDirectory, plotOptions);
-save(result.report.matFile, "cfg", "result", "radioStatus");
-
+result.report.responseFile = string(fullfile( ...
+    result.report.directory, "response.json"));
+result.report.metricsResponseFile = string(fullfile( ...
+    result.report.directory, "metrics_response.json"));
+result.report.artifactsResponseFile = string(fullfile( ...
+    result.report.directory, "artifacts_response.json"));
 if strlength(pairDirectory) > 0
-    manifestFile = fullfile(pairDirectory, "pair_manifest.mat");
-    pairManifest = localLoadManifest(manifestFile, pairDirectory, ...
-        referenceFile, captureFile);
-    pairManifest.status = "processed";
-    pairManifest.processedAt = string(datetime("now", ...
-        "Format", "yyyy-MM-dd HH:mm:ss.SSS"));
-    pairManifest.reportDirectory = result.report.directory;
-    save(manifestFile, "pairManifest");
+    result.report.latestResponseFile = string(fullfile( ...
+        pairDirectory, "response.json"));
+else
+    result.report.latestResponseFile = result.report.responseFile;
+end
+result.softwareResponse = otfs_tr_build_software_response( ...
+    result, "metrics_completed");
+localPublishResponse(result.softwareResponse, result.report, ...
+    result.report.metricsResponseFile);
+localUpdateManifest(pairDirectory, referenceFile, captureFile, ...
+    result.report, "metrics_completed");
+
+try
+    plotDirectory = fullfile(result.report.directory, "diagnostic_plots");
+    plotOptions = struct("showFigures", false, "closeFigures", true);
+    result.diagnosticPlotFiles = wide_rx_plot_diagnostics( ...
+        result, tx.params, plotDirectory, plotOptions);
+    result.softwareResponse = otfs_tr_build_software_response( ...
+        result, "artifacts_completed");
+    archivedResult = otfs_tr_compact_result_for_save(result, cfg);
+    archivePayload = struct("cfg", cfg, "result", archivedResult, ...
+        "radioStatus", radioStatus);
+    save(result.report.matFile, "-struct", "archivePayload");
+    localPublishResponse(result.softwareResponse, result.report, ...
+        result.report.artifactsResponseFile);
+    localUpdateManifest(pairDirectory, referenceFile, captureFile, ...
+        result.report, "artifacts_completed");
+catch exception
+    failureResponse = result.softwareResponse;
+    failureResponse.status = "failed";
+    failureResponse.stage = "artifacts_failed";
+    failureResponse.code = 1999;
+    failureResponse.error_code = "ARTIFACT_GENERATION_FAILED";
+    failureResponse.message = string(exception.message);
+    failureResponse.updated_at = string(datetime("now", ...
+        "TimeZone", "Asia/Shanghai", ...
+        "Format", "yyyy-MM-dd'T'HH:mm:ssXXX"));
+    localPublishResponse(failureResponse, result.report, "");
+    localUpdateManifest(pairDirectory, referenceFile, captureFile, ...
+        result.report, "artifacts_failed");
+    rethrow(exception);
 end
 
 fprintf("Offline comparison: CFO=%+.1f Hz, frames=%d, bits=%d, errors=%d, BER=%.9g\n", ...
     result.cfoEstimateHz, result.validFrames, result.totalBits, ...
     result.totalErrors, result.ber);
+fprintf("Transfer rate=%.6f Mbit/s (%d received bits / %.6f s)\n", ...
+    result.transferRateBps/1e6, result.receivedBitsForRate, ...
+    result.receiveDurationSeconds);
 fprintf("Spectral efficiency=%.3f bit/s/Hz, overall pass=%d\n", ...
-    cfg.designSpectralEfficiency, result.acceptance.pass);
+    cfg.designSpectralEfficiency, result.overallPass);
 fprintf("Report: %s\n", result.report.textFile);
+end
+
+function localPublishResponse(response, report, snapshotFile)
+if strlength(string(snapshotFile)) > 0
+    otfs_tr_write_json_atomic(snapshotFile, response);
+end
+otfs_tr_write_json_atomic(report.responseFile, response);
+if report.latestResponseFile ~= report.responseFile
+    otfs_tr_write_json_atomic(report.latestResponseFile, response);
+end
+end
+
+function localUpdateManifest(pairDirectory, referenceFile, captureFile, ...
+        report, stage)
+if strlength(pairDirectory) == 0
+    return;
+end
+manifestFile = fullfile(pairDirectory, "pair_manifest.mat");
+pairManifest = localLoadManifest(manifestFile, pairDirectory, ...
+    referenceFile, captureFile);
+pairManifest.processingStage = stage;
+pairManifest.reportDirectory = report.directory;
+pairManifest.responseFile = report.latestResponseFile;
+timestamp = string(datetime("now", ...
+    "Format", "yyyy-MM-dd HH:mm:ss.SSS"));
+switch stage
+    case "metrics_completed"
+        pairManifest.status = "processing";
+        pairManifest.metricsCompletedAt = timestamp;
+    case "artifacts_completed"
+        pairManifest.status = "processed";
+        pairManifest.processedAt = timestamp;
+        pairManifest.artifactsCompletedAt = timestamp;
+    otherwise
+        pairManifest.status = "failed";
+        pairManifest.artifactsFailedAt = timestamp;
+end
+save(manifestFile, "pairManifest");
+end
+
+function runId = localRunId(pairDirectory)
+if strlength(pairDirectory) > 0
+    [~, runId] = fileparts(pairDirectory);
+    runId = string(runId);
+else
+    runId = "";
+end
 end
 
 function cfg = localApplyCurrentReceiverDefaults(cfg, currentCfg)
@@ -100,7 +242,16 @@ receiverFields = [ ...
     "rowBiasMaxMagnitude", "rowBiasMinImprovementRatio", ...
     "rowBiasMinCoherence", ...
     "enableMpNoiseVarianceCalibration", ...
-    "mpNoiseCalibrationMinRatio"];
+    "mpNoiseCalibrationMinRatio", "mpMaximumIterations", ...
+    "enableSharedMpNoiseCalibration", ...
+    "sharedMpNoiseCalibrationFrames", ...
+    "sharedMpNoiseCalibrationMinimumValidFrames", ...
+    "enableFrameParallel", "frameParallelWorkers", ...
+    "frameParallelMinimumFrames", ...
+    "enableProgressReporting", "progressFile", ...
+    "progressUpdateEveryFrames", ...
+    "progressMinimumIntervalSeconds", ...
+    "saveFullDiagnostics", "savedFullDiagnosticFrames"];
 for fieldIndex = 1:numel(receiverFields)
     fieldName = receiverFields(fieldIndex);
     if ~isfield(cfg, fieldName) && isfield(currentCfg, fieldName)

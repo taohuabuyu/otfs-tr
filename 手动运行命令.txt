@@ -1,0 +1,85 @@
+OTFS-TR 当前版本手动运行命令
+================================
+
+使用说明：
+1. TX和RX分别在两台电脑的MATLAB命令窗口执行。
+2. 两台电脑均需存在相同的MAT测试用例文件。
+3. 先启动TX；看到“Onboard continuous transmission started”后，再启动RX。
+4. 以下命令不读取任何TX/RX配置TXT。
+5. 当前示例使用-600 kHz等效频偏，发射60秒。
+6. TX默认按otfs_tr_config.m设置，对完整发射波形注入20 dB复AWGN。
+7. RX不知道TX加噪参数，RX命令不变。
+
+
+一、TX端命令
+--------------------------------
+
+clear functions;
+restoredefaultpath;
+cd("D:\Program Files\MATLAB\R2025a\otfs");
+addpath(pwd,'-begin');
+rehash toolboxcache;
+rehash;
+
+caseFile = fullfile(pwd,"test_cases","CASE-OTFS-8QAM-001-airid.mat");
+
+txConfig = struct( ...
+    "test_case_file",caseFile, ...
+    "equivalent_cfo_hz",-600e3, ...
+    "options",struct("duration_seconds",60));
+
+txRun = run_otfs_tr_transmitter(txConfig);
+
+% 查看TX实际加噪证据：
+txRun.txAwgn
+
+
+二、RX端命令
+--------------------------------
+
+clear functions;
+restoredefaultpath;
+cd("D:\Program Files\MATLAB\R2025a\otfs");
+addpath(pwd,'-begin');
+rehash toolboxcache;
+rehash;
+
+caseFile = fullfile(pwd,"test_cases","CASE-OTFS-8QAM-001-airid.mat");
+
+rxRun = run_otfs_tr_receiver(caseFile);
+
+
+三、RX结果查看命令
+--------------------------------
+
+rxRun.responseFile
+rxRun.localRunId
+rxRun.result.testCaseId
+rxRun.result.ber
+rxRun.result.totalErrors
+rxRun.result.totalBits
+rxRun.result.validFrames
+rxRun.result.cfoEstimateHz
+rxRun.result.residualCfoHz
+rxRun.result.acceptance
+rxRun.result.overallPass
+
+
+四、验证+600 kHz时
+--------------------------------
+
+将TX命令中的：
+
+"equivalent_cfo_hz",-600e3
+
+改为：
+
+"equivalent_cfo_hz",+600e3
+
+RX命令不变。RX不知道TX设置的频偏，实际CFO由接收算法从捕获IQ中盲估计。
+
+
+安全要求
+--------------------------------
+
+禁止两台X310之间无衰减直连。必须使用经过确认的射频衰减器，或使用合适的空口测试环境。

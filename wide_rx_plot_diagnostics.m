@@ -207,7 +207,7 @@ else
         "Location", "best");
 end
 paths = localSaveFigure(fig, fullfile(plotDir, ...
-    "equalized_constellation_worst_frame"), opts);
+    "constellation_8qam"), opts);
 end
 
 function paths = localPlotEvmAndPhase(results, plotDir, opts)

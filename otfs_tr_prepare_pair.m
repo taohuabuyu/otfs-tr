@@ -19,12 +19,12 @@ end
 rxDirectory = fullfile(pairDirectory, "rx");
 txDirectory = fullfile(pairDirectory, "tx");
 reportDirectory = fullfile(pairDirectory, "reports");
-mkdir(rxDirectory);
-mkdir(txDirectory);
-mkdir(reportDirectory);
+localEnsureDirectory(rxDirectory);
+localEnsureDirectory(txDirectory);
+localEnsureDirectory(reportDirectory);
 
 pair = struct();
-pair.version = 1;
+pair.version = 2;
 pair.runId = runId;
 pair.createdAt = string(datetime("now", ...
     "Format", "yyyy-MM-dd HH:mm:ss.SSS"));
@@ -40,4 +40,10 @@ pair.manifestFile = string(fullfile(pairDirectory, "pair_manifest.mat"));
 
 pairManifest = pair;
 save(pair.manifestFile, "pairManifest");
+end
+
+function localEnsureDirectory(directory)
+if ~exist(directory, "dir")
+    mkdir(directory);
+end
 end

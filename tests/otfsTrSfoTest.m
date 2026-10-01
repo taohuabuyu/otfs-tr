@@ -88,7 +88,7 @@ classdef otfsTrSfoTest < matlab.unittest.TestCase
             cfg.txBufferFrameCount = 32;
             cfg.txBurstLength = cfg.txBufferFrameCount*cfg.frameLength10;
             cfg.totalUniquePayloadBits = cfg.superframeLength* ...
-                cfg.payloadBitsPerFrame;
+                cfg.effectiveBitsPerFrame;
             cfg.sfoMinimumPreambles = 12;
             [txSignal, ~, params, training] = ...
                 otfs_tr_build_waveform(cfg);

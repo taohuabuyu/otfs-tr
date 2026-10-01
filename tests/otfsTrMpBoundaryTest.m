@@ -40,7 +40,8 @@ classdef otfsTrMpBoundaryTest < matlab.unittest.TestCase
             receivedGrid = OTFS_demodulation(N, M, receivedSamples);
 
             % Act: detect with the exact single integer channel tap.
-            detectedGrid = OTFS_MP_Detection(N, M, modulationOrder, ...
+            [detectedGrid, ~, ~, ~, info] = OTFS_MP_Detection( ...
+                N, M, modulationOrder, ...
                 1, 0, integerDoppler, 1, 1e-8, receivedGrid);
             symbolErrors = detectedGrid ~= transmittedGrid;
 
@@ -48,6 +49,23 @@ classdef otfsTrMpBoundaryTest < matlab.unittest.TestCase
             testCase.verifyEqual(nnz(symbolErrors), 0);
             testCase.verifyEqual(nnz(symbolErrors(1, :)), 0);
             testCase.verifyEqual(nnz(symbolErrors(end, :)), 0);
+            testCase.verifyGreaterThan(info.iterationCount, 0);
+            testCase.verifyLessThanOrEqual(info.iterationCount, ...
+                info.maximumIterations);
+            testCase.verifyTrue(info.converged);
+        end
+
+        function testRejectsInvalidMaximumIterations(testCase)
+            % Arrange.
+            cfg = otfs_tr_config();
+            cfg.mpMaximumIterations = 0;
+
+            % Act.
+            operation = @() otfs_tr_validate_config(cfg);
+
+            % Assert.
+            testCase.verifyError(operation, ...
+                "otfs_tr:InvalidMpMaximumIterations");
         end
     end
 end

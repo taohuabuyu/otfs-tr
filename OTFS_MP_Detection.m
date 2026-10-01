@@ -25,12 +25,16 @@
 %    - Latest version of this code may be downloaded from: https://ecse.monash.edu/staff/eviterbo/
 %    - Freely distributed for educational and research purposes
 %%
-function [x_est, x_soft, decision_confidence, x_observation] = ...
+function [x_est, x_soft, decision_confidence, x_observation, info] = ...
     OTFS_MP_Detection( ...
-    N,M,M_mod,taps,delay_taps,Doppler_taps,chan_coef,sigma_2,y)
+    N,M,M_mod,taps,delay_taps,Doppler_taps,chan_coef,sigma_2,y,options)
+
+if nargin < 10
+    options = struct();
+end
 
 yv = reshape(y,N*M,1);
-n_ite = 200;
+n_ite = localField(options, "mpMaximumIterations", 200);
 delta_fra = 0.6;
 alphabet = qammod(0:M_mod-1,M_mod,'gray','UnitAveragePower',true);
 
@@ -40,6 +44,8 @@ p_map = ones(N*M,taps,M_mod)*(1/M_mod);
 ln_qi = zeros(1,M_mod);
 
 conv_rate_prev = -0.1;
+conv_rate = 0;
+terminationReason = "maximum_iterations";
 for ite=1:n_ite
     %% Update mean and var
     for ele1=1:1:M
@@ -135,11 +141,13 @@ for ite=1:n_ite
     conv_rate =  sum(max(sum_prob_comp,[],2)>0.99)/(N*M);
     if conv_rate==1
         sum_prob_fin = sum_prob_comp;
+        terminationReason = "fully_converged";
         break;
     elseif conv_rate > conv_rate_prev
         conv_rate_prev = conv_rate;
         sum_prob_fin = sum_prob_comp;
     elseif (conv_rate < conv_rate_prev - 0.2) && conv_rate_prev > 0.95
+        terminationReason = "convergence_regressed";
         break;
     end
 end
@@ -191,5 +199,19 @@ for ele1=1:1:M
             x_observation(ele2,ele1) = x_soft(ele2,ele1);
         end
     end
+end
+info = struct("iterationCount", ite, ...
+    "maximumIterations", n_ite, ...
+    "finalConvergenceRate", conv_rate, ...
+    "bestConvergenceRate", conv_rate_prev, ...
+    "converged", conv_rate == 1, ...
+    "terminationReason", terminationReason);
+end
+
+function value = localField(s, name, defaultValue)
+if isfield(s, name) && ~isempty(s.(name))
+    value = s.(name);
+else
+    value = defaultValue;
 end
 end

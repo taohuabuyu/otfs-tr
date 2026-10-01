@@ -1,8 +1,11 @@
-function cfg = otfs_tr_config(modulationOrder)
+function cfg = otfs_tr_config(modulationOrder, captureDurationSeconds)
 %otfs_tr_config Central user-editable configuration for OTFS-TR.
 
 if nargin < 1
     modulationOrder = 8;
+end
+if nargin < 2
+    captureDurationSeconds = 0.12;
 end
 
 cfg = struct();
@@ -20,8 +23,11 @@ cfg.rxRadioConfiguration = "My USRP X310";
 cfg.txAntenna = "RFB:TX/RX";
 cfg.rxAntenna = "RFA:RX2";
 cfg.masterClockRate = 200e6;
-cfg.txCenterFrequencyHz = 2.6756e9;
+% Keep RX tuned to a fixed RF center. Positive equivalentDopplerHz means
+% RX center is above TX center, so the received baseband CFO is negative.
+cfg.rxCenterFrequencyHz = 2.675e9;
 cfg.equivalentDopplerHz = -600e3;
+cfg = otfs_tr_apply_equivalent_cfo(cfg, cfg.equivalentDopplerHz);
 cfg.txGainDb = 5;
 cfg.rxGainDb = 20;
 cfg.txChannelMapping = 2;
@@ -42,7 +48,7 @@ cfg.N = 32;
 cfg.M = 24;
 cfg.MMod = modulationOrder;
 cfg.MBits = log2(cfg.MMod);
-cfg.waveformVersion = 2;
+cfg.waveformVersion = 3;
 cfg.cpLen = 64;
 cfg.xPilot = 2 + 2i;
 cfg.mPilot = 12;
@@ -60,7 +66,7 @@ cfg.preambleRoot = 25;
 cfg.zerosAheadLen = 0;
 cfg.zerosTailLen = 0;
 cfg.txBufferDurationSeconds = 0.09;
-cfg.rxCaptureDurationSeconds = 0.08;
+cfg.rxCaptureDurationSeconds = captureDurationSeconds;
 cfg.decodeFrameMarginRatio = 0.10;
 cfg.superframeLength = 1024;
 cfg.frameIdBits = 10;
@@ -69,6 +75,13 @@ cfg.headerRepetition = 3;
 cfg.targetTxRms = 0.20;
 cfg.targetPayloadTxRms = 0.20;
 cfg.hardwareTxPeak = 0.95;
+
+%% TX-only digital AWGN injection.
+% Noise is added to the complete waveform immediately before upload to the
+% TX X310. These settings are never passed to the RX entry point.
+cfg.enableTxAwgn = true;
+cfg.txAwgnSnrDb = 20;
+cfg.txAwgnSeed = 20260929;
 
 %% Receiver synchronization and residual-CFO correction.
 cfg.cfoSearchHz = -800e3:50e3:800e3;
@@ -104,6 +117,10 @@ cfg.rowBiasMinImprovementRatio = 1.25;
 cfg.rowBiasMinCoherence = 0.65;
 cfg.enableMpNoiseVarianceCalibration = true;
 cfg.mpNoiseCalibrationMinRatio = 1.25;
+cfg.mpMaximumIterations = 50;
+cfg.enableSharedMpNoiseCalibration = true;
+cfg.sharedMpNoiseCalibrationFrames = 8;
+cfg.sharedMpNoiseCalibrationMinimumValidFrames = 4;
 cfg.cpFineSearchRadius = 32;
 cfg.cpFineMinScore = 0.65;
 cfg.cpFineRelativeMargin = 1.10;
@@ -111,6 +128,20 @@ cfg.applyCpCfoCorrection = true;
 cfg.wideDownsampleMode = "fir";
 cfg.gridPlotFrames = [1 2 3 4 5 10 15 20];
 cfg.maxGridPlots = 8;
+cfg.saveFullDiagnostics = false;
+cfg.savedFullDiagnosticFrames = cfg.gridPlotFrames;
+
+%% Host-side frame detection parallelism.
+% Global synchronization remains serial. Only independent per-frame OTFS
+% demodulation, channel estimation, MP detection, and bit comparison run on
+% local process workers. Small jobs stay serial to avoid pool overhead.
+cfg.enableFrameParallel = true;
+cfg.frameParallelWorkers = 6;
+cfg.frameParallelMinimumFrames = 32;
+cfg.enableProgressReporting = true;
+cfg.progressFile = "";
+cfg.progressUpdateEveryFrames = 10;
+cfg.progressMinimumIntervalSeconds = 0.8;
 
 %% Capture and acceptance.
 cfg.captureCallCount = 1;
@@ -121,6 +152,17 @@ cfg.minimumDopplerHz = 500e3;
 cfg.minimumSpectralEfficiency = 2;
 cfg.requireNoRadioErrors = true;
 cfg.offlineSnrDb = 40;
+
+%% Short application payload carried by the 8-QAM waveform.
+cfg.applicationProtocolVersion = 1;
+cfg.applicationMagic = uint8([hex2dec("4F") hex2dec("54")]);
+cfg.applicationPayloadType = 1;
+cfg.applicationMaxPayloadBytes = 32;
+cfg.applicationMinimumConsistentFrames = 3;
+cfg.controlProtocolVersion = "1.0";
+cfg.defaultTransmitDurationSeconds = 30;
+cfg.minimumTransmitDurationSeconds = 5;
+cfg.maximumTransmitDurationSeconds = 300;
 
 %% Derived design metrics.
 cfg.designBitRateBps = cfg.fsTx * cfg.MBits;
@@ -148,9 +190,23 @@ cfg.headerPaddingBits = cfg.headerMappedBits-cfg.headerCodedBits;
 cfg.payloadSymbolsPerFrame = cfg.dataSymbolsPerFrame - ...
     cfg.headerSymbolsPerFrame;
 cfg.payloadBitsPerFrame = cfg.payloadSymbolsPerFrame*cfg.MBits;
-cfg.effectiveBitsPerFrame = cfg.payloadBitsPerFrame;
+cfg.applicationEnabled = cfg.MMod == 8;
+if cfg.applicationEnabled
+    cfg.applicationPacketBytes = 2 + 1 + 1 + 4 + 2 + ...
+        cfg.applicationMaxPayloadBytes + 4;
+    cfg.applicationPacketBits = 8*cfg.applicationPacketBytes;
+    cfg.applicationMappedBitsPerFrame = ceil( ...
+        cfg.applicationPacketBits/cfg.MBits)*cfg.MBits;
+else
+    cfg.applicationPacketBytes = 0;
+    cfg.applicationPacketBits = 0;
+    cfg.applicationMappedBitsPerFrame = 0;
+end
+cfg.berTestBitsPerFrame = cfg.payloadBitsPerFrame - ...
+    cfg.applicationMappedBitsPerFrame;
+cfg.effectiveBitsPerFrame = cfg.berTestBitsPerFrame;
 cfg.totalUniquePayloadBits = cfg.superframeLength* ...
-    cfg.payloadBitsPerFrame;
+    cfg.berTestBitsPerFrame;
 statisticalMinimumTestBits = floor(3/cfg.maximumBer) + 1;
 cfg.minimumTestBits = max(statisticalMinimumTestBits, ...
     cfg.targetTestBits);

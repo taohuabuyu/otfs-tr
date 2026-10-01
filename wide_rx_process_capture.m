@@ -74,38 +74,161 @@ end
 %% Per-frame OTFS demodulation, DD-channel estimation, detection, and BER.
 maxFrames = min(localGetField(p, "maxDecodedFrames", Inf), ...
     numel(payloadStarts));
-ber = nan(maxFrames, 1);
-frameDiagnostics = repmat(localEmptyFrameDiagnostics(params), ...
-    maxFrames, 1);
-seenFrameIds = false(max(1, reference.superframeLength), 1);
-previousFrameId = NaN;
-headerCrcFailures = 0;
-duplicateFrameIds = 0;
-sequenceDiscontinuities = 0;
+frameBlocks = cell(maxFrames, 1);
 for frameIdx = 1:maxFrames
     frameStart = payloadStarts(frameIdx);
     frameEnd = frameStart + params.blockLen - 1;
-    if frameStart < 1 || frameEnd > numel(rx10)
-        continue;
+    if frameStart >= 1 && frameEnd <= numel(rx10)
+        frameBlocks{frameIdx} = rx10(frameStart:frameEnd);
+    else
+        frameBlocks{frameIdx} = complex(zeros(0, 1));
     end
+end
 
-    rxBlock = rx10(frameStart:frameEnd);
-    rxBlock = localApplyPreambleAndCpCorrections( ...
-        rxBlock, frameInfo(frameIdx), p);
-    frameSettings = p;
-    fallbackApplied = localShouldUseDdPilotCfoFallback( ...
-        frameInfo(frameIdx), p);
-    if fallbackApplied
-        frameSettings.frameResidualCfoSearchHz = localGetField( ...
-            p, "ddPilotResidualCfoSearchHz", -3000:100:3000);
+[useFrameParallel, frameParallelInfo] = ...
+    localPrepareFrameParallelism(p, maxFrames);
+berCandidates = nan(maxFrames, 1);
+diagnosticCells = cell(maxFrames, 1);
+progressEnabled = logical(localGetField( ...
+    p, "enableProgressReporting", false)) && ...
+    strlength(string(localGetField(p, "progressFile", ""))) > 0;
+progressFile = string(localGetField(p, "progressFile", ""));
+progressEveryFrames = localGetField(p, ...
+    "progressUpdateEveryFrames", 10);
+progressMinimumSeconds = localGetField(p, ...
+    "progressMinimumIntervalSeconds", 0.5);
+progressCompletedFrames = 0;
+progressValidFrames = 0;
+progressTestedBits = 0;
+progressBitErrors = 0;
+progressWriteCount = 0;
+progressWriteElapsedSeconds = zeros(0, 1);
+progressLastWriteSeconds = 0;
+progressTimer = tic;
+progressQueue = [];
+if progressEnabled
+    localWriteProgress("detection_started", NaN);
+    if useFrameParallel
+        progressQueue = parallel.pool.DataQueue;
+        afterEach(progressQueue, @localReceiveFrameProgress);
     end
-    frameSettings.ddPilotResidualCfoFallbackApplied = fallbackApplied;
-    [ber(frameIdx), frameDiagnostics(frameIdx)] = ...
-        localDetectOtfsFrameAndMeasureBer( ...
-        rxBlock, params, reference, frameSettings);
+end
+detectionTimer = tic;
+sharedCalibrationRequested = logical(localGetField( ...
+    p, "enableSharedMpNoiseCalibration", false)) && ...
+    logical(localGetField(p, "enableMpNoiseVarianceCalibration", false));
+if sharedCalibrationRequested
+    requestedCalibrationFrames = localGetField( ...
+        p, "sharedMpNoiseCalibrationFrames", 8);
+    calibrationFrameCount = min(maxFrames, requestedCalibrationFrames);
+    minimumCalibrationFrames = localGetField(p, ...
+        "sharedMpNoiseCalibrationMinimumValidFrames", 4);
+    if maxFrames > minimumCalibrationFrames
+        calibrationFrameCount = min(calibrationFrameCount, maxFrames-1);
+    end
+else
+    calibrationFrameCount = 0;
+end
+for frameIdx = 1:calibrationFrameCount
+    [berCandidates(frameIdx), diagnosticCells{frameIdx}] = ...
+        localDetectPreparedFrame(frameBlocks{frameIdx}, ...
+        frameInfo(frameIdx), params, reference, p);
+    if progressEnabled
+        localReceiveFrameProgress(localFrameProgressPayload( ...
+            frameIdx, berCandidates(frameIdx), ...
+            diagnosticCells{frameIdx}));
+    end
+end
+sharedCalibrationRatio = localSharedMpCalibrationRatio( ...
+    diagnosticCells(1:calibrationFrameCount), p);
+remainingSettings = p;
+remainingSettings.sharedMpNoiseCalibrationRatio = ...
+    sharedCalibrationRatio;
+remainingFrameIndices = (calibrationFrameCount+1:maxFrames).';
+remainingFrameBlocks = frameBlocks(remainingFrameIndices);
+remainingFrameInfo = frameInfo(remainingFrameIndices);
+remainingBer = nan(numel(remainingFrameIndices), 1);
+remainingDiagnostics = cell(numel(remainingFrameIndices), 1);
+if useFrameParallel
+    parfor remainingIndex = 1:numel(remainingFrameIndices)
+        frameIdx = remainingFrameIndices(remainingIndex);
+        [remainingBer(remainingIndex), ...
+            remainingDiagnostics{remainingIndex}] = ...
+            localDetectPreparedFrame( ...
+            remainingFrameBlocks{remainingIndex}, ...
+            remainingFrameInfo(remainingIndex), params, reference, ...
+            remainingSettings);
+        if progressEnabled
+            send(progressQueue, localFrameProgressPayload( ...
+                frameIdx, remainingBer(remainingIndex), ...
+                remainingDiagnostics{remainingIndex}));
+        end
+    end
+else
+    for remainingIndex = 1:numel(remainingFrameIndices)
+        frameIdx = remainingFrameIndices(remainingIndex);
+        [remainingBer(remainingIndex), ...
+            remainingDiagnostics{remainingIndex}] = ...
+            localDetectPreparedFrame( ...
+            remainingFrameBlocks{remainingIndex}, ...
+            remainingFrameInfo(remainingIndex), params, reference, ...
+            remainingSettings);
+        if progressEnabled
+            localReceiveFrameProgress(localFrameProgressPayload( ...
+                frameIdx, remainingBer(remainingIndex), ...
+                remainingDiagnostics{remainingIndex}));
+        end
+    end
+end
+berCandidates(remainingFrameIndices) = remainingBer;
+diagnosticCells(remainingFrameIndices) = remainingDiagnostics;
+frameParallelInfo.detectionElapsedSeconds = toc(detectionTimer);
+frameParallelInfo.progressReportingEnabled = progressEnabled;
+frameParallelInfo.progressDataQueueUsed = progressEnabled && useFrameParallel;
+frameParallelInfo.progressFile = progressFile;
+frameParallelInfo.progressWriteCount = progressWriteCount;
+frameParallelInfo.sharedMpNoiseCalibrationRequested = ...
+    sharedCalibrationRequested;
+frameParallelInfo.sharedMpNoiseCalibrationFrames = ...
+    calibrationFrameCount;
+frameParallelInfo.sharedMpNoiseCalibrationRatio = ...
+    sharedCalibrationRatio;
+frameParallelInfo.sharedMpNoiseCalibrationAppliedFrames = ...
+    numel(remainingFrameIndices)*isfinite(sharedCalibrationRatio);
+if progressEnabled
+    localWriteProgress("detection_completed", ...
+        frameParallelInfo.detectionElapsedSeconds);
+    frameParallelInfo.progressWriteCount = progressWriteCount;
+    frameParallelInfo.progressWriteElapsedSeconds = ...
+        progressWriteElapsedSeconds;
+    frameParallelInfo.progressUpdateIntervalsSeconds = ...
+        diff(progressWriteElapsedSeconds);
+else
+    frameParallelInfo.progressWriteElapsedSeconds = zeros(0, 1);
+    frameParallelInfo.progressUpdateIntervalsSeconds = zeros(0, 1);
+end
+if maxFrames > 0
+    frameDiagnostics = vertcat(diagnosticCells{:});
+else
+    frameDiagnostics = repmat(localEmptyFrameDiagnostics(params), 0, 1);
+end
+ber = berCandidates;
+
+aggregationTimer = tic;
+seenFrameIds = false(max(1, reference.superframeLength), 1);
+previousFrameId = NaN;
+headerCrcFailures = 0;
+caseCodeMismatches = 0;
+duplicateFrameIds = 0;
+sequenceDiscontinuities = 0;
+for frameIdx = 1:maxFrames
     if reference.mode == "unique-superframe"
         if ~frameDiagnostics(frameIdx).headerValid
             headerCrcFailures = headerCrcFailures + 1;
+            continue;
+        end
+        if ~frameDiagnostics(frameIdx).caseCodeMatch
+            caseCodeMismatches = caseCodeMismatches + 1;
             continue;
         end
         frameId = frameDiagnostics(frameIdx).frameId;
@@ -124,6 +247,7 @@ for frameIdx = 1:maxFrames
         previousFrameId = frameId;
     end
 end
+frameParallelInfo.aggregationElapsedSeconds = toc(aggregationTimer);
 
 %% Return both final BER and intermediate signals needed for diagnosis plots.
 results = struct();
@@ -152,13 +276,17 @@ results.sfoInfo = sfoInfo;
 results.fractionalTimingInfo = fractionalTimingInfo;
 results.frameInfo = frameInfo;
 results.frameDiagnostics = frameDiagnostics;
+results.frameParallelInfo = frameParallelInfo;
 results.referenceMode = reference.mode;
+results.referenceApplication = reference.application;
 results.frameIds = [frameDiagnostics.frameId].';
 results.headerCrcFailures = headerCrcFailures;
+results.caseCodeMismatches = caseCodeMismatches;
 results.duplicateFrameIds = duplicateFrameIds;
 results.sequenceDiscontinuities = sequenceDiscontinuities;
 results.referenceAlignmentPass = reference.mode == "legacy-repeated" || ...
-    (headerCrcFailures == 0 && duplicateFrameIds == 0 && ...
+    (headerCrcFailures == 0 && caseCodeMismatches == 0 && ...
+    duplicateFrameIds == 0 && ...
     sequenceDiscontinuities == 0 && any(isfinite(ber)));
 if isempty(frameInfo)
     results.syncInfo = struct();
@@ -166,6 +294,142 @@ else
     results.syncInfo = frameInfo(1);
 end
 results.cfoEstimateHz = cfoEstimateHz;
+
+    function localReceiveFrameProgress(payload)
+        progressCompletedFrames = progressCompletedFrames + 1;
+        progressValidFrames = progressValidFrames + payload.validFrame;
+        progressTestedBits = progressTestedBits + payload.testedBits;
+        progressBitErrors = progressBitErrors + payload.bitErrors;
+        elapsedSeconds = toc(progressTimer);
+        frameThresholdReached = ...
+            mod(progressCompletedFrames, progressEveryFrames) == 0;
+        timeThresholdReached = elapsedSeconds-progressLastWriteSeconds >= ...
+            progressMinimumSeconds;
+        if frameThresholdReached || timeThresholdReached || ...
+                progressCompletedFrames == maxFrames
+            localWriteProgress("detecting_frames", NaN);
+        end
+    end
+
+    function localWriteProgress(stage, detectionElapsedSeconds)
+        progress = struct();
+        progress.version = 1;
+        progress.stage = stage;
+        progress.updated_at = string(datetime("now", ...
+            "Format", "yyyy-MM-dd HH:mm:ss.SSS"));
+        progress.update_sequence = progressWriteCount + 1;
+        progress.completed_frames = progressCompletedFrames;
+        progress.total_frames = maxFrames;
+        progress.progress_fraction = progressCompletedFrames / ...
+            max(1, maxFrames);
+        progress.valid_frames_so_far = progressValidFrames;
+        progress.tested_bits_so_far = progressTestedBits;
+        progress.bit_errors_so_far = progressBitErrors;
+        if progressTestedBits > 0
+            progress.ber_so_far = progressBitErrors/progressTestedBits;
+        else
+            progress.ber_so_far = NaN;
+        end
+        progress.parallel_workers = frameParallelInfo.actualWorkers;
+        progress.data_queue_used = useFrameParallel;
+        progress.detection_elapsed_seconds = detectionElapsedSeconds;
+        otfs_tr_write_json_atomic(progressFile, progress);
+        progressWriteCount = progressWriteCount + 1;
+        progressLastWriteSeconds = toc(progressTimer);
+        progressWriteElapsedSeconds(end+1, 1) = ...
+            progressLastWriteSeconds;
+    end
+end
+
+function payload = localFrameProgressPayload(frameIndex, ber, diag)
+payload = struct("frameIndex", frameIndex, ...
+    "validFrame", isfinite(ber), ...
+    "testedBits", numel(diag.bitErrors), ...
+    "bitErrors", sum(diag.bitErrors));
+end
+
+function ratio = localSharedMpCalibrationRatio(diagnosticCells, p)
+ratio = NaN;
+if isempty(diagnosticCells)
+    return;
+end
+valid = false(numel(diagnosticCells), 1);
+ratios = nan(numel(diagnosticCells), 1);
+for index = 1:numel(diagnosticCells)
+    diag = diagnosticCells{index};
+    valid(index) = ~isempty(diag) && ...
+        diag.mpNoiseCalibrationApplied && ...
+        isfinite(diag.mpNoiseCalibrationRatio);
+    if valid(index)
+        ratios(index) = diag.mpNoiseCalibrationRatio;
+    end
+end
+minimumValidFrames = localGetField(p, ...
+    "sharedMpNoiseCalibrationMinimumValidFrames", 4);
+if nnz(valid) >= minimumValidFrames
+    ratio = median(ratios(valid), "omitnan");
+end
+end
+
+function [ber, diag] = localDetectPreparedFrame( ...
+        rxBlock, frameInfo, params, reference, p)
+diag = localEmptyFrameDiagnostics(params);
+ber = NaN;
+if isempty(rxBlock)
+    return;
+end
+rxBlock = localApplyPreambleAndCpCorrections(rxBlock, frameInfo, p);
+frameSettings = p;
+fallbackApplied = localShouldUseDdPilotCfoFallback(frameInfo, p);
+if fallbackApplied
+    frameSettings.frameResidualCfoSearchHz = localGetField( ...
+        p, "ddPilotResidualCfoSearchHz", -3000:100:3000);
+end
+frameSettings.ddPilotResidualCfoFallbackApplied = fallbackApplied;
+[ber, diag] = localDetectOtfsFrameAndMeasureBer( ...
+    rxBlock, params, reference, frameSettings);
+end
+
+function [useParallel, info] = localPrepareFrameParallelism(p, frameCount)
+requested = logical(localGetField(p, "enableFrameParallel", false));
+requestedWorkers = localGetField(p, "frameParallelWorkers", 1);
+minimumFrames = localGetField(p, "frameParallelMinimumFrames", Inf);
+info = struct("requested", requested, "used", false, ...
+    "requestedWorkers", requestedWorkers, "actualWorkers", 0, ...
+    "minimumFrames", minimumFrames, "poolCreated", false, ...
+    "status", "disabled", "detectionElapsedSeconds", NaN, ...
+    "aggregationElapsedSeconds", NaN);
+useParallel = false;
+if ~requested
+    return;
+end
+if frameCount < minimumFrames
+    info.status = "below-minimum-frame-count";
+    return;
+end
+if isempty(ver("parallel"))
+    info.status = "parallel-toolbox-unavailable";
+    return;
+end
+
+pool = gcp("nocreate");
+if isempty(pool)
+    workerCount = min(requestedWorkers, frameCount);
+    projectRoot = localGetField(p, "projectRoot", fileparts(mfilename("fullpath")));
+    cluster = parcluster("Processes");
+    cluster.NumWorkers = max(cluster.NumWorkers, workerCount);
+    pool = parpool(cluster, workerCount, ...
+        AdditionalPaths=string(projectRoot));
+    info.poolCreated = true;
+end
+info.actualWorkers = pool.NumWorkers;
+useParallel = pool.NumWorkers > 1;
+info.used = useParallel;
+if useParallel
+    info.status = "parallel";
+else
+    info.status = "single-worker-pool";
+end
 end
 
 function useFallback = localShouldUseDdPilotCfoFallback(frameInfo, p)
@@ -611,23 +875,47 @@ diag.tapsUsed = taps;
 
 % MP detection uses the estimated DD-domain sparse channel to recover symbols.
 sigmaEst = max(sigmaEst, 1e-8);
-[xEst, xPosteriorMean, decisionConfidence, xObservation] = ...
+sharedCalibrationRatio = localGetField( ...
+    p, "sharedMpNoiseCalibrationRatio", NaN);
+sharedCalibrationApplied = isfinite(sharedCalibrationRatio) && ...
+    sharedCalibrationRatio >= localGetField( ...
+    p, "mpNoiseCalibrationMinRatio", 1.25);
+if sharedCalibrationApplied
+    initialMpVariance = max(sigmaEst*sharedCalibrationRatio, 1e-8);
+else
+    initialMpVariance = sigmaEst;
+end
+[xEst, xPosteriorMean, decisionConfidence, xObservation, firstMpInfo] = ...
     OTFS_MP_Detection( ...
     params.N, params.M, params.MMod, taps, ...
-    delayTaps, dopplerTaps, chanCoef, sigmaEst, rxGrid);
+    delayTaps, dopplerTaps, chanCoef, initialMpVariance, rxGrid, p);
+finalMpInfo = firstMpInfo;
+totalMpIterations = firstMpInfo.iterationCount;
 xEst = reshape(xEst, params.N, params.M);
 xPosteriorMean = reshape(xPosteriorMean, params.N, params.M);
 xObservation = reshape(xObservation, params.N, params.M);
 decisionConfidence = reshape(decisionConfidence, params.N, params.M);
 [xObservationCorrected, xEstCorrected, rowBiasInfo] = ...
     localCorrectStructuredRowBias(xObservation, xEst, params, p);
-[sigmaEffective, noiseInfo] = localCalibrateMpNoiseVariance( ...
-    xObservationCorrected, xEstCorrected, chanCoef, sigmaEst, params, p);
-if noiseInfo.applied
-    [xEst, xPosteriorMean, decisionConfidence, xObservation] = ...
+if sharedCalibrationApplied
+    sigmaEffective = initialMpVariance;
+    noiseInfo = struct("applied", true, ...
+        "ratio", sharedCalibrationRatio, ...
+        "equalizedVariance", NaN, ...
+        "candidateVariance", initialMpVariance, ...
+        "source", "shared");
+else
+    [sigmaEffective, noiseInfo] = localCalibrateMpNoiseVariance( ...
+        xObservationCorrected, xEstCorrected, chanCoef, ...
+        sigmaEst, params, p);
+    noiseInfo.source = "per-frame";
+end
+if noiseInfo.applied && ~sharedCalibrationApplied
+    [xEst, xPosteriorMean, decisionConfidence, xObservation, finalMpInfo] = ...
         OTFS_MP_Detection( ...
         params.N, params.M, params.MMod, taps, ...
-        delayTaps, dopplerTaps, chanCoef, sigmaEffective, rxGrid);
+        delayTaps, dopplerTaps, chanCoef, sigmaEffective, rxGrid, p);
+    totalMpIterations = totalMpIterations + finalMpInfo.iterationCount;
     xEst = reshape(xEst, params.N, params.M);
     xPosteriorMean = reshape(xPosteriorMean, params.N, params.M);
     xObservation = reshape(xObservation, params.N, params.M);
@@ -654,7 +942,14 @@ diag.rowBiasCoherenceByRow = rowBiasInfo.coherenceByRow;
 diag.sigmaEffective = sigmaEffective;
 diag.mpNoiseCalibrationApplied = noiseInfo.applied;
 diag.mpNoiseCalibrationRatio = noiseInfo.ratio;
+diag.mpNoiseCalibrationSource = noiseInfo.source;
 diag.decisionDirectedSigmaEqualized = noiseInfo.equalizedVariance;
+diag.mpFirstPassIterations = firstMpInfo.iterationCount;
+diag.mpFinalPassIterations = finalMpInfo.iterationCount;
+diag.mpTotalIterations = totalMpIterations;
+diag.mpConverged = finalMpInfo.converged;
+diag.mpFinalConvergenceRate = finalMpInfo.finalConvergenceRate;
+diag.mpTerminationReason = finalMpInfo.terminationReason;
 diag.dataSymbols = dataSymbols;
 diag.softDataSymbols = softDataSymbols;
 diag.posteriorMeanDataSymbols = posteriorMeanDataSymbols;
@@ -679,23 +974,52 @@ if reference.mode == "unique-superframe"
     end
     headerBits = reshape(demappedRows( ...
         1:params.headerSymbolsPerFrame, :), [], 1);
-    [frameId, headerValid, headerInformationBits] = ...
+    [frameId, headerValid, headerInformationBits, caseCode] = ...
         otfs_tr_decode_frame_header(headerBits, params);
     diag.frameId = frameId;
     diag.headerValid = headerValid;
     diag.headerEstimatedBits = headerBits;
     diag.headerInformationBits = headerInformationBits;
+    diag.caseCode = caseCode;
     if ~headerValid
         ber = NaN;
         return;
     end
-    estimatedBits = reshape(demappedRows( ...
+    if localGetField(params, "frameCaseIdBits", 0) > 0
+        diag.caseCodeMatch = isfield(reference, "testCase") && ...
+            isfield(reference.testCase, "caseCode") && ...
+            caseCode == reference.testCase.caseCode;
+        if ~diag.caseCodeMatch
+            ber = NaN;
+            return;
+        end
+    end
+    estimatedPayloadBits = reshape(demappedRows( ...
         params.headerSymbolsPerFrame+1:end, :), [], 1);
-    refBits = reference.payloadBitsByFrame(:, frameId+1);
-    expectedHeaderBits = otfs_tr_encode_frame_header(frameId, params);
+    expectedPayloadBits = reference.payloadBitsByFrame(:, frameId+1);
+    applicationBits = localGetField(params, ...
+        "applicationMappedBitsPerFrame", 0);
+    if applicationBits > 0 && isfield(reference, "berTestBitsByFrame")
+        diag.application = otfs_tr_decode_application( ...
+            estimatedPayloadBits(1:applicationBits), p);
+        diag.estimatedApplicationBits = ...
+            estimatedPayloadBits(1:applicationBits);
+        estimatedBits = estimatedPayloadBits(applicationBits+1:end);
+        refBits = reference.berTestBitsByFrame(:, frameId+1);
+    else
+        estimatedBits = estimatedPayloadBits;
+        refBits = expectedPayloadBits;
+    end
+    diag.estimatedPayloadBits = estimatedPayloadBits;
+    if localGetField(params, "frameCaseIdBits", 0) > 0
+        expectedHeaderBits = otfs_tr_encode_frame_header( ...
+            frameId, params, reference.testCase.caseCode);
+    else
+        expectedHeaderBits = otfs_tr_encode_frame_header(frameId, params);
+    end
     expectedHeaderRows = reshape(expectedHeaderBits, ...
         params.headerSymbolsPerFrame, params.MBits);
-    expectedPayloadRows = reshape(refBits, [], params.MBits);
+    expectedPayloadRows = reshape(expectedPayloadBits, [], params.MBits);
     expectedRows = [expectedHeaderRows; expectedPayloadRows];
     expectedSymbols = qammod(bi2de(expectedRows), params.MMod, ...
         "gray", "UnitAveragePower", true);
@@ -876,6 +1200,13 @@ diag.sigmaEst = NaN;
 diag.sigmaEffective = NaN;
 diag.mpNoiseCalibrationApplied = false;
 diag.mpNoiseCalibrationRatio = NaN;
+diag.mpNoiseCalibrationSource = "none";
+diag.mpFirstPassIterations = 0;
+diag.mpFinalPassIterations = 0;
+diag.mpTotalIterations = 0;
+diag.mpConverged = false;
+diag.mpFinalConvergenceRate = NaN;
+diag.mpTerminationReason = "not_run";
 diag.decisionDirectedSigmaEqualized = NaN;
 diag.delayTapsUsed = [];
 diag.dopplerTapsUsed = [];
@@ -895,6 +1226,12 @@ diag.commonComplexGain = NaN;
 diag.commonGainMagnitude = NaN;
 diag.commonPhaseErrorRad = NaN;
 diag.estimatedBits = zeros(0, 1);
+diag.estimatedPayloadBits = zeros(0, 1);
+diag.estimatedApplicationBits = zeros(0, 1);
+diag.application = struct("valid", false, "crcPass", false, ...
+    "paddingPass", false, ...
+    "decodedText", "", "payloadBytes", 0, ...
+    "errorCode", "NOT_DECODED");
 diag.refBits = zeros(0, 1);
 diag.bitErrors = false(0, 1);
 diag.errorBitPositions = zeros(0, 1);
@@ -910,6 +1247,8 @@ diag.frameDcEstimate = NaN;
 diag.frameDcRemovalApplied = false;
 diag.frameId = NaN;
 diag.headerValid = false;
+diag.caseCode = uint32(0);
+diag.caseCodeMatch = true;
 diag.headerEstimatedBits = zeros(0, 1);
 diag.headerInformationBits = zeros(0, 1);
 diag.duplicateFrameId = false;
@@ -955,14 +1294,27 @@ if isstruct(referenceInput) && ...
     reference.mode = "unique-superframe";
     reference.payloadBitsByFrame = referenceInput.payloadBitsByFrame;
     reference.superframeLength = size(reference.payloadBitsByFrame, 2);
+    if isfield(referenceInput, "berTestBitsByFrame")
+        reference.berTestBitsByFrame = referenceInput.berTestBitsByFrame;
+    end
+    if isfield(referenceInput, "application")
+        reference.application = referenceInput.application;
+    else
+        reference.application = struct("enabled", false);
+    end
+    if isfield(referenceInput, "testCase")
+        reference.testCase = referenceInput.testCase;
+    end
 elseif isstruct(referenceInput) && isfield(referenceInput, "bitsPerFrame")
     reference.mode = "legacy-repeated";
     reference.bitsPerFrame = referenceInput.bitsPerFrame(:);
     reference.superframeLength = 1;
+    reference.application = struct("enabled", false);
 else
     reference.mode = "legacy-repeated";
     reference.bitsPerFrame = referenceInput(:);
     reference.superframeLength = 1;
+    reference.application = struct("enabled", false);
 end
 end
 

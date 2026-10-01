@@ -15,9 +15,15 @@ acceptance.minimumValidFrames = cfg.minimumValidFrames;
 acceptance.validFrames = result.validFrames;
 acceptance.validFramesPass = result.validFrames >= cfg.minimumValidFrames;
 acceptance.minimumDopplerHz = cfg.minimumDopplerHz;
-acceptance.testedDopplerHz = abs(result.requestedDopplerHz);
-acceptance.dopplerPass = abs(result.requestedDopplerHz) > ...
-    cfg.minimumDopplerHz;
+if isfinite(result.requestedDopplerHz)
+    acceptance.dopplerSource = "configured_cfo";
+    acceptance.testedDopplerHz = abs(result.requestedDopplerHz);
+else
+    acceptance.dopplerSource = "estimated_cfo";
+    acceptance.testedDopplerHz = abs(result.cfoEstimateHz);
+end
+acceptance.dopplerPass = isfinite(acceptance.testedDopplerHz) && ...
+    acceptance.testedDopplerHz > cfg.minimumDopplerHz;
 acceptance.minimumSpectralEfficiency = cfg.minimumSpectralEfficiency;
 acceptance.designSpectralEfficiency = cfg.designSpectralEfficiency;
 acceptance.spectralEfficiencyPass = cfg.designSpectralEfficiency >= ...
