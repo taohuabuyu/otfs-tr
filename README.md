@@ -95,6 +95,8 @@ rxRun = run_otfs_tr_receiver("D:/config/otfs_rx_cfg.txt");
 ```
 
 RX完成采集后自动进行同步、CFO/SFO校正、OTFS解调、MP检测、BER计算并生成报告。`rxRun.responseFile`指向软件可读取的`response.json`。
+帧检测期间会原子更新运行目录中的`progress.json`。默认每累计`100000`个有效、去重后的测试比特发布一次阶段BER；处理开始和完成状态也会写入该文件。可通过中心配置`cfg.progressUpdateEveryBits`改为`200000`等其他正整数阈值。
+常规处理默认在指标和文本/JSON报告完成后立即返回，不生成耗时的PNG、FIG和结果MAT。需要完整诊断产物时，在中心配置中设置`cfg.generateDiagnosticArtifacts = true`后重新处理保存的IQ。
 每次处理完成后，软件还按`参与BER统计的接收bit数 / RX接收时长`计算传输速率，并在控制台、`acceptance_report.txt`和`response.json`中显示。
 
 不使用配置TXT时，RX只需提供本地测试用例；频偏始终从捕获IQ中估计：

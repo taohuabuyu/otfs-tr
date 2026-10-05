@@ -128,6 +128,9 @@ cfg.applyCpCfoCorrection = true;
 cfg.wideDownsampleMode = "fir";
 cfg.gridPlotFrames = [1 2 3 4 5 10 15 20];
 cfg.maxGridPlots = 8;
+% Routine runs return after metrics. Enable only when diagnostic plots and
+% the compact result MAT archive are explicitly required.
+cfg.generateDiagnosticArtifacts = false;
 cfg.saveFullDiagnostics = false;
 cfg.savedFullDiagnosticFrames = cfg.gridPlotFrames;
 
@@ -140,8 +143,8 @@ cfg.frameParallelWorkers = 6;
 cfg.frameParallelMinimumFrames = 32;
 cfg.enableProgressReporting = true;
 cfg.progressFile = "";
-cfg.progressUpdateEveryFrames = 10;
-cfg.progressMinimumIntervalSeconds = 0.8;
+% Publish one provisional BER update per 100,000 valid, de-duplicated bits.
+cfg.progressUpdateEveryBits = 100e3;
 
 %% Capture and acceptance.
 cfg.captureCallCount = 1;

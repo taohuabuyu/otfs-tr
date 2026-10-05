@@ -5,9 +5,10 @@ if nargin < 2
     stage = "artifacts_completed";
 end
 stage = string(stage);
-if ~ismember(stage, ["metrics_completed", "artifacts_completed"])
+if ~ismember(stage, ["metrics_completed", "artifacts_completed", ...
+        "artifacts_skipped"])
     error("otfs_tr:InvalidResponseStage", ...
-        "Response stage must be metrics_completed or artifacts_completed.");
+        "Response stage is not supported.");
 end
 
 response = struct();
@@ -20,6 +21,10 @@ response.stage = stage;
 if stage == "metrics_completed"
     response.message = "Metrics completed; artifacts are pending.";
     response.status = "processing";
+elseif stage == "artifacts_skipped"
+    response.message = ...
+        "Signal processing completed; optional artifacts were skipped.";
+    response.status = "completed";
 else
     response.message = "Signal processing completed.";
     response.status = "completed";
@@ -87,8 +92,9 @@ response.acceptance = struct( ...
 
 constellationPath = localConstellationPath(result);
 artifactsCompleted = stage == "artifacts_completed";
+artifactsSkipped = stage == "artifacts_skipped";
 response.artifacts = struct( ...
-    "status", localArtifactStatus(artifactsCompleted), ...
+    "status", localArtifactStatus(artifactsCompleted, artifactsSkipped), ...
     "constellation_image_path", constellationPath, ...
     "result_mat_path", string(result.report.matFile), ...
     "report_text_path", string(result.report.textFile), ...
@@ -99,16 +105,18 @@ response.artifacts = struct( ...
 response.updated_at = string(datetime("now", ...
     "TimeZone", "Asia/Shanghai", ...
     "Format", "yyyy-MM-dd'T'HH:mm:ssXXX"));
-if artifactsCompleted
+if artifactsCompleted || artifactsSkipped
     response.completed_at = response.updated_at;
 else
     response.completed_at = "";
 end
 end
 
-function status = localArtifactStatus(completed)
+function status = localArtifactStatus(completed, skipped)
 if completed
     status = "completed";
+elseif skipped
+    status = "skipped";
 else
     status = "pending";
 end

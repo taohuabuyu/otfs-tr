@@ -93,21 +93,25 @@ progressEnabled = logical(localGetField( ...
     p, "enableProgressReporting", false)) && ...
     strlength(string(localGetField(p, "progressFile", ""))) > 0;
 progressFile = string(localGetField(p, "progressFile", ""));
-progressEveryFrames = localGetField(p, ...
-    "progressUpdateEveryFrames", 10);
-progressMinimumSeconds = localGetField(p, ...
-    "progressMinimumIntervalSeconds", 0.5);
+progressEveryBits = localGetField(p, ...
+    "progressUpdateEveryBits", 100e3);
+progressNextBitThreshold = progressEveryBits;
 progressCompletedFrames = 0;
 progressValidFrames = 0;
 progressTestedBits = 0;
 progressBitErrors = 0;
 progressWriteCount = 0;
+progressBerUpdateCount = 0;
+progressPublishedTestedBits = zeros(0, 1);
 progressWriteElapsedSeconds = zeros(0, 1);
-progressLastWriteSeconds = 0;
 progressTimer = tic;
 progressQueue = [];
+progressReadyFrames = false(maxFrames, 1);
+progressPendingPayloads = cell(maxFrames, 1);
+progressNextFrameIndex = 1;
+progressSeenFrameIds = false(max(1, reference.superframeLength), 1);
 if progressEnabled
-    localWriteProgress("detection_started", NaN);
+    localWriteProgress("detection_started", NaN, false);
     if useFrameParallel
         progressQueue = parallel.pool.DataQueue;
         afterEach(progressQueue, @localReceiveFrameProgress);
@@ -197,8 +201,11 @@ frameParallelInfo.sharedMpNoiseCalibrationAppliedFrames = ...
     numel(remainingFrameIndices)*isfinite(sharedCalibrationRatio);
 if progressEnabled
     localWriteProgress("detection_completed", ...
-        frameParallelInfo.detectionElapsedSeconds);
+        frameParallelInfo.detectionElapsedSeconds, false);
     frameParallelInfo.progressWriteCount = progressWriteCount;
+    frameParallelInfo.progressBerUpdateCount = progressBerUpdateCount;
+    frameParallelInfo.progressPublishedTestedBits = ...
+        progressPublishedTestedBits;
     frameParallelInfo.progressWriteElapsedSeconds = ...
         progressWriteElapsedSeconds;
     frameParallelInfo.progressUpdateIntervalsSeconds = ...
@@ -206,6 +213,8 @@ if progressEnabled
 else
     frameParallelInfo.progressWriteElapsedSeconds = zeros(0, 1);
     frameParallelInfo.progressUpdateIntervalsSeconds = zeros(0, 1);
+    frameParallelInfo.progressBerUpdateCount = 0;
+    frameParallelInfo.progressPublishedTestedBits = zeros(0, 1);
 end
 if maxFrames > 0
     frameDiagnostics = vertcat(diagnosticCells{:});
@@ -297,21 +306,44 @@ results.cfoEstimateHz = cfoEstimateHz;
 
     function localReceiveFrameProgress(payload)
         progressCompletedFrames = progressCompletedFrames + 1;
-        progressValidFrames = progressValidFrames + payload.validFrame;
-        progressTestedBits = progressTestedBits + payload.testedBits;
-        progressBitErrors = progressBitErrors + payload.bitErrors;
-        elapsedSeconds = toc(progressTimer);
-        frameThresholdReached = ...
-            mod(progressCompletedFrames, progressEveryFrames) == 0;
-        timeThresholdReached = elapsedSeconds-progressLastWriteSeconds >= ...
-            progressMinimumSeconds;
-        if frameThresholdReached || timeThresholdReached || ...
-                progressCompletedFrames == maxFrames
-            localWriteProgress("detecting_frames", NaN);
+        progressReadyFrames(payload.frameIndex) = true;
+        progressPendingPayloads{payload.frameIndex} = payload;
+        while progressNextFrameIndex <= maxFrames && ...
+                progressReadyFrames(progressNextFrameIndex)
+            orderedPayload = ...
+                progressPendingPayloads{progressNextFrameIndex};
+            acceptFrame = orderedPayload.validFrame;
+            if acceptFrame && reference.mode == "unique-superframe"
+                stateIndex = orderedPayload.frameId + 1;
+                if progressSeenFrameIds(stateIndex)
+                    acceptFrame = false;
+                else
+                    progressSeenFrameIds(stateIndex) = true;
+                end
+            end
+            if acceptFrame
+                progressValidFrames = progressValidFrames + 1;
+                progressTestedBits = progressTestedBits + ...
+                    orderedPayload.testedBits;
+                progressBitErrors = progressBitErrors + ...
+                    orderedPayload.bitErrors;
+            end
+            progressNextFrameIndex = progressNextFrameIndex + 1;
+        end
+        if progressTestedBits >= progressNextBitThreshold
+            localWriteProgress("detecting_frames", NaN, true);
+            progressNextBitThreshold = ...
+                (floor(progressTestedBits/progressEveryBits) + 1) * ...
+                progressEveryBits;
         end
     end
 
-    function localWriteProgress(stage, detectionElapsedSeconds)
+    function localWriteProgress(stage, detectionElapsedSeconds, berUpdate)
+        if berUpdate
+            progressBerUpdateCount = progressBerUpdateCount + 1;
+            progressPublishedTestedBits(end+1, 1) = ...
+                progressTestedBits;
+        end
         progress = struct();
         progress.version = 1;
         progress.stage = stage;
@@ -325,6 +357,9 @@ results.cfoEstimateHz = cfoEstimateHz;
         progress.valid_frames_so_far = progressValidFrames;
         progress.tested_bits_so_far = progressTestedBits;
         progress.bit_errors_so_far = progressBitErrors;
+        progress.ber_update_interval_bits = progressEveryBits;
+        progress.ber_update_count = progressBerUpdateCount;
+        progress.is_ber_update = logical(berUpdate);
         if progressTestedBits > 0
             progress.ber_so_far = progressBitErrors/progressTestedBits;
         else
@@ -335,15 +370,15 @@ results.cfoEstimateHz = cfoEstimateHz;
         progress.detection_elapsed_seconds = detectionElapsedSeconds;
         otfs_tr_write_json_atomic(progressFile, progress);
         progressWriteCount = progressWriteCount + 1;
-        progressLastWriteSeconds = toc(progressTimer);
         progressWriteElapsedSeconds(end+1, 1) = ...
-            progressLastWriteSeconds;
+            toc(progressTimer);
     end
 end
 
 function payload = localFrameProgressPayload(frameIndex, ber, diag)
 payload = struct("frameIndex", frameIndex, ...
     "validFrame", isfinite(ber), ...
+    "frameId", diag.frameId, ...
     "testedBits", numel(diag.bitErrors), ...
     "bitErrors", sum(diag.bitErrors));
 end
@@ -460,7 +495,10 @@ info = struct("enabled", localGetField( ...
     "pilotSelectedOffsetSamples10", 0, ...
     "selectedOffsetSamples10", 0, "baselineScore", NaN, ...
     "bestScore", NaN, "improvementRatio", NaN, ...
-    "estimationFrames", 0);
+    "estimationFrames", 0, ...
+    "searchInterpolatedSamples", 0, ...
+    "fullCaptureEquivalentSamples", 0, ...
+    "searchSampleReductionRatio", NaN);
 if ~info.enabled
     return;
 end
@@ -475,29 +513,37 @@ scoreMatrix = nan(frameLimit, numel(searchGrid));
 preambleScoreMatrix = nan(frameLimit, numel(searchGrid));
 preamble10 = preamble10(:);
 preambleEnergy = sum(abs(preamble10).^2);
+fullCaptureEquivalentSamples = numel(rx10)*numel(searchGrid);
+searchInterpolatedSamples = 0;
 for gridIndex = 1:numel(searchGrid)
-    candidateRx10 = localFractionalShift(rx10, searchGrid(gridIndex));
     for frameIndex = 1:frameLimit
         firstSample = payloadStarts(frameIndex);
         lastSample = firstSample + params.blockLen - 1;
-        if firstSample < 1 || lastSample > numel(candidateRx10)
+        preambleStart = frameInfo(frameIndex).preambleStart10;
+        preambleEnd = preambleStart + numel(preamble10) - 1;
+        if firstSample < 1 || lastSample > numel(rx10) || ...
+                preambleStart < 1 || preambleEnd > numel(rx10)
             continue;
         end
-        candidateBlock = candidateRx10(firstSample:lastSample);
+        [candidateBlock, candidatePreamble, querySamples] = ...
+            localFractionalTimingWindows(rx10, firstSample, ...
+            lastSample, preambleStart, preambleEnd, ...
+            searchGrid(gridIndex));
+        searchInterpolatedSamples = searchInterpolatedSamples + ...
+            querySamples;
         rxData = candidateBlock(params.LCp+1:end);
         rxGrid = OTFS_demodulation(params.N, params.M, rxData);
         scoreMatrix(frameIndex, gridIndex) = ...
             localPilotConcentrationScore(rxGrid, params);
-        preambleStart = frameInfo(frameIndex).preambleStart10;
-        preambleEnd = preambleStart + numel(preamble10) - 1;
-        if preambleStart >= 1 && preambleEnd <= numel(candidateRx10)
-            candidatePreamble = candidateRx10(preambleStart:preambleEnd);
-            preambleScoreMatrix(frameIndex, gridIndex) = ...
-                abs(preamble10' * candidatePreamble)^2 / ...
-                (preambleEnergy*sum(abs(candidatePreamble).^2) + eps);
-        end
+        preambleScoreMatrix(frameIndex, gridIndex) = ...
+            abs(preamble10' * candidatePreamble)^2 / ...
+            (preambleEnergy*sum(abs(candidatePreamble).^2) + eps);
     end
 end
+info.searchInterpolatedSamples = searchInterpolatedSamples;
+info.fullCaptureEquivalentSamples = fullCaptureEquivalentSamples;
+info.searchSampleReductionRatio = searchInterpolatedSamples / ...
+    max(1, fullCaptureEquivalentSamples);
 info.concentrationScores = median(scoreMatrix, 1, "omitnan").';
 info.preambleScores = median(preambleScoreMatrix, 1, "omitnan").';
 info.estimationFrames = sum(any(isfinite(scoreMatrix), 2));
@@ -532,6 +578,32 @@ else
     info.applied = true;
     info.status = "applied";
 end
+end
+
+function [candidateBlock, candidatePreamble, querySamples] = ...
+        localFractionalTimingWindows(signal, blockStart, blockEnd, ...
+        preambleStart, preambleEnd, offsetSamples)
+% Interpolate only the training windows used by the timing score. Two
+% samples of context on each side preserve the interior PCHIP slopes that
+% would be obtained by interpolating the complete capture.
+targetStart = min(blockStart, preambleStart);
+targetEnd = max(blockEnd, preambleEnd);
+targetIndices = (targetStart:targetEnd).';
+querySamples = numel(targetIndices);
+if abs(offsetSamples) < 10*eps
+    shiftedWindow = signal(targetIndices);
+else
+    queryIndices = targetIndices + offsetSamples;
+    sourceStart = max(1, floor(min(queryIndices))-2);
+    sourceEnd = min(numel(signal), ceil(max(queryIndices))+2);
+    sourceIndices = (sourceStart:sourceEnd).';
+    shiftedWindow = interp1(sourceIndices, signal(sourceIndices), ...
+        queryIndices, "pchip", 0);
+end
+blockIndices = (blockStart:blockEnd).' - targetStart + 1;
+preambleIndices = (preambleStart:preambleEnd).' - targetStart + 1;
+candidateBlock = shiftedWindow(blockIndices);
+candidatePreamble = shiftedWindow(preambleIndices);
 end
 
 function shifted = localFractionalShift(signal, offsetSamples)

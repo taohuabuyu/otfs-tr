@@ -43,8 +43,7 @@ for index = 1:numel(workerCounts)
     tx.cfg.enableProgressReporting = true;
     tx.cfg.progressFile = string(fullfile(benchmarkDirectory, ...
         "progress_" + workerCount + "_workers.json"));
-    tx.cfg.progressUpdateEveryFrames = 10;
-    tx.cfg.progressMinimumIntervalSeconds = 0.5;
+    tx.cfg.progressUpdateEveryBits = 100e3;
     if ~isempty(mpMaximumIterations)
         tx.cfg.mpMaximumIterations = mpMaximumIterations;
     end

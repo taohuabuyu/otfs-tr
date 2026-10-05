@@ -149,6 +149,11 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 -0.18, AbsTol=0.06);
             testCase.verifyGreaterThan( ...
                 result.fractionalTimingInfo.improvementRatio, 1.01);
+            testCase.verifyLessThan( ...
+                result.fractionalTimingInfo.searchSampleReductionRatio, 1);
+            testCase.verifyLessThan( ...
+                result.fractionalTimingInfo.searchInterpolatedSamples, ...
+                result.fractionalTimingInfo.fullCaptureEquivalentSamples);
             testCase.verifyEqual(result.totalErrors, 0);
         end
 
@@ -240,6 +245,27 @@ classdef otfsTrTest < matlab.unittest.TestCase
 
             testCase.verifyError(operation, ...
                 "otfs_tr:InvalidTransportDataType");
+        end
+
+        function testDiagnosticArtifactsAreDisabledByDefault(testCase)
+            % Arrange and act.
+            cfg = otfs_tr_config();
+
+            % Assert.
+            testCase.verifyFalse(cfg.generateDiagnosticArtifacts);
+        end
+
+        function testRejectsInvalidDiagnosticArtifactFlag(testCase)
+            % Arrange.
+            cfg = otfs_tr_config();
+            cfg.generateDiagnosticArtifacts = 2;
+
+            % Act.
+            operation = @() otfs_tr_validate_config(cfg);
+
+            % Assert.
+            testCase.verifyError(operation, ...
+                "otfs_tr:InvalidDiagnosticArtifactConfiguration");
         end
 
         function testAcceptancePassesQualifiedResult(testCase)
@@ -384,6 +410,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
 
         function testSavedReferenceAndCaptureOfflineDecode(testCase)
             cfg = otfsTrTest.fastConfiguration();
+            cfg.generateDiagnosticArtifacts = true;
             tempRoot = string(tempname);
             mkdir(tempRoot);
             testCase.addTeardown(@() rmdir(tempRoot, "s"));
@@ -476,12 +503,23 @@ classdef otfsTrTest < matlab.unittest.TestCase
             latestResponse = jsondecode(fileread(latestResponseFile));
             manifest = load(pair.manifestFile, "pairManifest");
             testCase.verifyEqual(string(latestResponse.stage), ...
-                "artifacts_completed");
+                "artifacts_skipped");
+            testCase.verifyEqual(string(latestResponse.status), ...
+                "completed");
+            testCase.verifyEqual(string(latestResponse.artifacts.status), ...
+                "skipped");
             testCase.verifyEqual(string( ...
                 manifest.pairManifest.processingStage), ...
-                "artifacts_completed");
+                "artifacts_skipped");
             testCase.verifyEqual(string(manifest.pairManifest.status), ...
                 "processed");
+            testCase.verifyFalse(result.artifactsGenerated);
+            testCase.verifyEmpty(result.diagnosticPlotFiles);
+            testCase.verifyFalse(isfile(result.report.matFile));
+            testCase.verifyFalse(isfolder(fullfile( ...
+                result.report.directory, "diagnostic_plots")));
+            testCase.verifyTrue(isfile( ...
+                result.report.artifactsResponseFile));
         end
 
         function testRejectsMismatchedWaveformVersions(testCase)

@@ -73,8 +73,7 @@ classdef otfsTrParallelTest < matlab.unittest.TestCase
             mkdir(progressDirectory);
             testCase.addTeardown(@() rmdir(progressDirectory, "s"));
             cfg.progressFile = fullfile(progressDirectory, "progress.json");
-            cfg.progressUpdateEveryFrames = 1;
-            cfg.progressMinimumIntervalSeconds = 0;
+            cfg.progressUpdateEveryBits = 2*cfg.effectiveBitsPerFrame;
 
             % Act.
             result = otfs_tr_simulate_link(cfg, 600e3, Inf);
@@ -94,9 +93,35 @@ classdef otfsTrParallelTest < matlab.unittest.TestCase
                 result.attemptedFrames);
             testCase.verifyEqual(progress.valid_frames_so_far, ...
                 result.validFrames);
+            testCase.verifyEqual(progress.tested_bits_so_far, ...
+                result.totalBits);
+            testCase.verifyEqual(progress.bit_errors_so_far, ...
+                result.totalErrors);
+            testCase.verifyEqual(progress.ber_so_far, result.ber, ...
+                AbsTol=0);
+            testCase.verifyEqual(progress.ber_update_interval_bits, ...
+                cfg.progressUpdateEveryBits);
+            testCase.verifyEqual(progress.ber_update_count, 3);
+            testCase.verifyFalse(logical(progress.is_ber_update));
+            testCase.verifyEqual(result.frameParallelInfo. ...
+                progressBerUpdateCount, 3);
+            testCase.verifyEqual(result.frameParallelInfo. ...
+                progressPublishedTestedBits, ...
+                cfg.effectiveBitsPerFrame*(2:2:6).');
             testCase.verifyEqual(progress.progress_fraction, 1, ...
                 AbsTol=0);
             testCase.verifyTrue(logical(progress.data_queue_used));
+        end
+
+        function testDefaultProgressIntervalIsOneHundredThousand(testCase)
+            % Arrange.
+            cfg = otfs_tr_config();
+
+            % Act.
+            actual = cfg.progressUpdateEveryBits;
+
+            % Assert.
+            testCase.verifyEqual(actual, 100000);
         end
 
         function testSharedMpCalibrationAvoidsSecondPass(testCase)
@@ -153,10 +178,10 @@ classdef otfsTrParallelTest < matlab.unittest.TestCase
         end
 
 
-        function testRejectsInvalidProgressFrameInterval(testCase)
+        function testRejectsInvalidProgressBitInterval(testCase)
             % Arrange.
             cfg = otfs_tr_config();
-            cfg.progressUpdateEveryFrames = 0;
+            cfg.progressUpdateEveryBits = 0;
 
             % Act.
             operation = @() otfs_tr_validate_config(cfg);
