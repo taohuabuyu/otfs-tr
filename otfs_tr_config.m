@@ -68,6 +68,7 @@ cfg.zerosTailLen = 0;
 cfg.txBufferDurationSeconds = 0.09;
 cfg.rxCaptureDurationSeconds = captureDurationSeconds;
 cfg.decodeFrameMarginRatio = 0.10;
+cfg.targetDecodedFrames = 800;
 cfg.superframeLength = 1024;
 cfg.frameIdBits = 10;
 cfg.frameCrcBits = 8;
@@ -149,6 +150,9 @@ cfg.progressUpdateEveryBits = 100e3;
 %% Capture and acceptance.
 cfg.captureCallCount = 1;
 cfg.captureBurstCount = cfg.captureCallCount;
+% RX software may execute one capture or an automatic sequence of captures.
+cfg.receiveMode = "single";
+cfg.receiveRoundCount = 1;
 cfg.maximumBer = 1e-5;
 cfg.targetTestBits = 1e6;
 cfg.minimumDopplerHz = 500e3;
@@ -220,6 +224,7 @@ cfg.availableCaptureFrames = floor( ...
     cfg.frameLength10) - 1;
 desiredDecodedFrames = ceil(cfg.minimumValidFrames * ...
     (1 + cfg.decodeFrameMarginRatio));
+desiredDecodedFrames = max(desiredDecodedFrames, cfg.targetDecodedFrames);
 cfg.maxDecodedFrames = min([desiredDecodedFrames, ...
     cfg.availableCaptureFrames, cfg.superframeLength]);
 end

@@ -1,12 +1,10 @@
 function rxRun = run_otfs_tr_receiver(receiverInput)
-%run_otfs_tr_receiver Capture a fixed raw-IQ window into X310 memory.
+%run_otfs_tr_receiver Capture and process one or more fixed RX windows.
 %
 % Preferred software entry: run_otfs_tr_receiver(rxConfigTxtPath).
 % Direct entry: run_otfs_tr_receiver(testCaseMatPath).
-% The RX TXT is intentionally parsed only after raw IQ has been saved.
-% It contains only testPayload=<RX-local MAT path>; TX CFO is unknown here.
-% The input may be one MAT file or a directory of MAT cases.
-% A directory enables automatic selection from the received air case code.
+% TXT fields receive_mode and receive_round_count select single or automatic
+% multi-round execution. TX configuration and control remain separate.
 
 cfg = otfs_tr_config();
 if nargin < 1
@@ -18,21 +16,25 @@ softwareTxtMode = inputOptions.softwareTxtMode;
 sourceConfigFile = inputOptions.sourceConfigFile;
 localTestCaseMode = inputOptions.localTestCaseMode;
 autoCaseMode = inputOptions.autoCaseMode;
-equivalentDopplerHz = inputOptions.equivalentDopplerHz;
-requestedCfoKnown = inputOptions.requestedCfoKnown;
+
+rxConfig = struct();
+if softwareTxtMode
+    % Multi-round controls must be known before the first hardware capture.
+    rxConfig = otfs_tr_load_receiver_config(sourceConfigFile, cfg);
+    cfg.receiveMode = rxConfig.receive_mode;
+    cfg.receiveRoundCount = rxConfig.receive_round_count;
+end
 % Zero is a neutral local snapshot only. Actual CFO is estimated from IQ.
 cfg = otfs_tr_apply_equivalent_cfo(cfg, 0);
 if localTestCaseMode
     cfg = otfs_tr_apply_test_case_mode(cfg);
 end
 otfs_tr_validate_config(cfg);
+if cfg.receiveMode == "multi" && (~localTestCaseMode || autoCaseMode)
+    error("otfs_tr:MultiRoundRequiresFixedTestCase", ...
+        "Multi-round RX requires one explicit TXT or MAT test case.");
+end
 
-pair = otfs_tr_prepare_pair(cfg);
-timestamp = pair.runId;
-runDirectory = pair.pairDirectory;
-captureFile = pair.captureFile;
-
-rxCenterFrequencyHz = cfg.rxCenterFrequencyHz;
 radio = radioConfigurations(cfg.rxRadioConfiguration);
 if string(radio.IPAddress) ~= cfg.rxAddress
     error("otfs_tr:RxRadioConfigurationAddressMismatch", ...
@@ -42,7 +44,7 @@ end
 rxRadio = basebandReceiver(radio, ...
     "Preload", true, ...
     "SampleRate", cfg.fsRx, ...
-    "CenterFrequency", rxCenterFrequencyHz, ...
+    "CenterFrequency", cfg.rxCenterFrequencyHz, ...
     "RadioGain", cfg.rxGainDb, ...
     "Antennas", cfg.rxAntenna, ...
     "CaptureDataType", "single", ...
@@ -50,15 +52,73 @@ rxRadio = basebandReceiver(radio, ...
 radioCleanup = onCleanup(@() localStopCapture(rxRadio));
 pause(cfg.radioWarmupSeconds);
 
-captureCalls = cfg.captureCallCount;
-if captureCalls ~= 1
-    error("otfs_tr:OnboardCaptureCallCount", ...
-        "Onboard RX uses exactly one fixed-window capture call.");
-end
 fprintf("OTFS-TR onboard RX ready on %s (%s) at %.6f GHz.\n", ...
-    cfg.rxRadioConfiguration, cfg.rxAddress, rxCenterFrequencyHz/1e9);
-fprintf("Capturing %d samples (%.3f s) through %s into X310 memory.\n", ...
-    cfg.rxSamplesPerFrame, cfg.rxCaptureDurationSeconds, cfg.rxAntenna);
+    cfg.rxRadioConfiguration, cfg.rxAddress, ...
+    cfg.rxCenterFrequencyHz/1e9);
+fprintf("RX receive mode=%s, rounds=%d, samples/round=%d (%.3f s).\n", ...
+    cfg.receiveMode, cfg.receiveRoundCount, cfg.rxSamplesPerFrame, ...
+    cfg.rxCaptureDurationSeconds);
+
+multiRun = struct();
+if cfg.receiveMode == "multi"
+    multiRun = localPrepareMultiRun(cfg);
+end
+roundRuns = cell(cfg.receiveRoundCount, 1);
+cumulative = struct();
+try
+    for roundIndex = 1:cfg.receiveRoundCount
+        fprintf("[RX] 第%d/%d轮开始\n", roundIndex, cfg.receiveRoundCount);
+        roundRuns{roundIndex} = localCaptureAndProcessRound( ...
+            rxRadio, cfg, inputOptions, rxConfig, roundIndex);
+        if cfg.receiveMode == "multi"
+            cumulative = otfs_tr_accumulate_results( ...
+                multiRun.cumulativeStateFile, ...
+                roundRuns{roundIndex}.result, cfg);
+            multiRun = localUpdateMultiRun( ...
+                multiRun, roundRuns{roundIndex}, cumulative, roundIndex);
+        end
+        fprintf("[RX] 第%d/%d轮完成\n", roundIndex, cfg.receiveRoundCount);
+    end
+catch exception
+    if cfg.receiveMode == "multi"
+        multiRun.status = "failed";
+        multiRun.errorIdentifier = string(exception.identifier);
+        multiRun.errorMessage = string(exception.message);
+        multiRun.updatedAt = localTimestamp();
+        localSaveMultiRun(multiRun);
+    end
+    rethrow(exception);
+end
+clear radioCleanup;
+
+if cfg.receiveMode == "single"
+    rxRun = roundRuns{1};
+    rxRun.receiveMode = "single";
+    rxRun.requestedRounds = 1;
+    rxRun.completedRounds = 1;
+else
+    rxRun = struct();
+    rxRun.receiveMode = "multi";
+    rxRun.requestedRounds = cfg.receiveRoundCount;
+    rxRun.completedRounds = cfg.receiveRoundCount;
+    rxRun.multiRunId = multiRun.multiRunId;
+    rxRun.multiRunDirectory = multiRun.directory;
+    rxRun.rounds = roundRuns;
+    rxRun.cumulative = cumulative;
+    rxRun.statusFile = multiRun.textFile;
+    rxRun.responseFile = multiRun.textFile;
+    rxRun.sourceConfigFile = sourceConfigFile;
+    fprintf("Multi-round cumulative result: %s\n", multiRun.textFile);
+end
+end
+
+function rxRun = localCaptureAndProcessRound( ...
+        rxRadio, cfg, inputOptions, rxConfig, roundIndex)
+pair = otfs_tr_prepare_pair(cfg);
+timestamp = pair.runId;
+captureFile = pair.captureFile;
+fprintf("Capturing %d samples through %s into X310 memory.\n", ...
+    cfg.rxSamplesPerFrame, cfg.rxAntenna);
 fprintf("[RX] 接收开始\n");
 captureStart = tic;
 [frame, captureTimestamp, droppedSamples] = capture( ...
@@ -69,8 +129,11 @@ rxLengths = numel(rx20);
 rxOverruns = logical(droppedSamples > 0);
 
 radioStatus = struct();
-radioStatus.captureCalls = captureCalls;
+radioStatus.captureCalls = 1;
 radioStatus.executionMode = "onboard-fixed-window";
+radioStatus.receiveMode = cfg.receiveMode;
+radioStatus.receiveRoundIndex = roundIndex;
+radioStatus.receiveRoundCount = cfg.receiveRoundCount;
 radioStatus.rxLengths = rxLengths;
 radioStatus.rxOverruns = rxOverruns;
 radioStatus.droppedSamples = double(droppedSamples);
@@ -78,68 +141,159 @@ radioStatus.captureTimestamp = captureTimestamp;
 radioStatus.captureWallSeconds = captureWallSeconds;
 radioStatus.anyRxOverrun = rxOverruns;
 radioStatus.totalReceivedSamples = numel(rx20);
-radioStatus.expectedReceivedSamples = captureCalls*cfg.rxSamplesPerFrame;
-radioStatus.captureComplete = all(rxLengths == cfg.rxSamplesPerFrame) && ...
-    radioStatus.totalReceivedSamples == radioStatus.expectedReceivedSamples;
+radioStatus.expectedReceivedSamples = cfg.rxSamplesPerFrame;
+radioStatus.captureComplete = rxLengths == cfg.rxSamplesPerFrame;
 radioStatus.captureDurationSeconds = numel(rx20)/cfg.fsRx;
 radioStatus.rxRms = sqrt(mean(abs(rx20).^2));
 radioStatus.rxPeak = max(abs(rx20));
+
+equivalentDopplerHz = inputOptions.equivalentDopplerHz;
+requestedCfoKnown = inputOptions.requestedCfoKnown;
+sourceConfigFile = inputOptions.sourceConfigFile;
+rxCenterFrequencyHz = cfg.rxCenterFrequencyHz;
 save(captureFile, "cfg", "rx20", "radioStatus", ...
     "equivalentDopplerHz", "requestedCfoKnown", ...
     "rxCenterFrequencyHz", "sourceConfigFile", "timestamp", "-v7.3");
 pair.status = "waiting-for-reference";
-pair.captureSavedAt = string(datetime("now", ...
-    "Format", "yyyy-MM-dd HH:mm:ss.SSS"));
+pair.captureSavedAt = localTimestamp();
+pair.receiveRoundIndex = roundIndex;
+pair.receiveRoundCount = cfg.receiveRoundCount;
 pairManifest = pair;
 save(pair.manifestFile, "pairManifest");
 fprintf("[RX] 接收完成\n");
 
 rxRun = struct();
 rxRun.captureFile = string(captureFile);
-rxRun.runDirectory = string(runDirectory);
+rxRun.runDirectory = pair.pairDirectory;
 rxRun.pairDirectory = pair.pairDirectory;
 rxRun.referenceDropDirectory = pair.txDirectory;
 rxRun.expectedReferenceFile = pair.expectedReferenceFile;
 rxRun.status = radioStatus;
 rxRun.localRunId = pair.runId;
 rxRun.sourceConfigFile = sourceConfigFile;
+rxRun.roundIndex = roundIndex;
+rxRun.requestedRounds = cfg.receiveRoundCount;
 fprintf("OTFS-TR RX saved raw IQ: %s\n", captureFile);
 fprintf("RX samples=%d/%d, complete=%d, anyOverrun=%d.\n", ...
     radioStatus.totalReceivedSamples, radioStatus.expectedReceivedSamples, ...
     radioStatus.captureComplete, radioStatus.anyRxOverrun);
-clear radioCleanup;
-if localTestCaseMode
-    if ~radioStatus.captureComplete || radioStatus.anyRxOverrun
-        error("otfs_tr:InvalidCapture", ...
-            "Capture is incomplete or contains dropped samples: %s", ...
-            captureFile);
-    end
-    fprintf("[RX] 开始处理\n");
-    if softwareTxtMode
-        rxConfig = otfs_tr_load_receiver_config(sourceConfigFile);
-        referenceCaseFile = rxConfig.test_case_file;
-        copyfile(sourceConfigFile, fullfile( ...
-            pair.pairDirectory, "receiver_config.txt"));
-    elseif autoCaseMode
-        selectedCase = otfs_tr_identify_test_case( ...
-            rx20, cfg, inputOptions.testCaseInput);
-        rxRun.selectedTestCase = selectedCase;
-        fprintf("Air case code %08X selected %s (%s).\n", ...
-            selectedCase.caseCode, selectedCase.caseId, ...
-            selectedCase.filePath);
-        referenceCaseFile = selectedCase.filePath;
-    else
-        referenceCaseFile = inputOptions.testCaseInput;
-    end
-    otfs_tr_prepare_local_reference( ...
-        cfg, equivalentDopplerHz, referenceCaseFile, pair);
-    rxRun.result = run_otfs_tr_offline_decode(pair.pairDirectory);
-    rxRun.responseFile = rxRun.result.report.responseFile;
-    fprintf("Software result: %s\n", rxRun.responseFile);
-    fprintf("[RX] 处理完成\n");
-else
-    fprintf("Use this capture with the matching TX reference file in the explicit two-file offline decoder.\n");
+
+if ~inputOptions.localTestCaseMode
+    fprintf(["Use this capture with the matching TX reference file in " ...
+        "the explicit two-file offline decoder.\n"]);
+    return;
 end
+if ~radioStatus.captureComplete || radioStatus.anyRxOverrun
+    error("otfs_tr:InvalidCapture", ...
+        "Capture is incomplete or contains dropped samples: %s", ...
+        captureFile);
+end
+
+fprintf("[RX] 开始处理\n");
+if inputOptions.softwareTxtMode
+    referenceCaseFile = rxConfig.test_case_file;
+    copyfile(sourceConfigFile, fullfile( ...
+        pair.pairDirectory, "receiver_config.txt"));
+elseif inputOptions.autoCaseMode
+    selectedCase = otfs_tr_identify_test_case( ...
+        rx20, cfg, inputOptions.testCaseInput);
+    rxRun.selectedTestCase = selectedCase;
+    fprintf("Air case code %08X selected %s (%s).\n", ...
+        selectedCase.caseCode, selectedCase.caseId, ...
+        selectedCase.filePath);
+    referenceCaseFile = selectedCase.filePath;
+else
+    referenceCaseFile = inputOptions.testCaseInput;
+end
+otfs_tr_prepare_local_reference( ...
+    cfg, equivalentDopplerHz, referenceCaseFile, pair);
+rxRun.result = run_otfs_tr_offline_decode(pair.pairDirectory);
+rxRun.responseFile = rxRun.result.report.responseFile;
+fprintf("Software result: %s\n", rxRun.responseFile);
+fprintf("[RX] 处理完成\n");
+end
+
+function multiRun = localPrepareMultiRun(cfg)
+root = fullfile(cfg.resultRoot, "multi_runs");
+if ~isfolder(root)
+    mkdir(root);
+end
+baseId = string(datetime("now", "Format", "yyyyMMdd_HHmmss_SSS"));
+multiRunId = baseId;
+directory = fullfile(root, multiRunId);
+collisionIndex = 0;
+while isfolder(directory)
+    collisionIndex = collisionIndex + 1;
+    multiRunId = baseId + "_" + compose("%02d", collisionIndex);
+    directory = fullfile(root, multiRunId);
+end
+mkdir(directory);
+
+multiRun = struct();
+multiRun.version = 1;
+multiRun.multiRunId = multiRunId;
+multiRun.directory = string(directory);
+multiRun.receiveMode = "multi";
+multiRun.requestedRounds = cfg.receiveRoundCount;
+multiRun.completedRounds = 0;
+multiRun.currentRound = 0;
+multiRun.status = "running";
+multiRun.latestLocalRunId = "";
+multiRun.latestPairDirectory = "";
+multiRun.cumulativeValidFrames = 0;
+multiRun.cumulativeTestedBits = 0;
+multiRun.cumulativeBitErrors = 0;
+multiRun.cumulativeBer = NaN;
+multiRun.cumulativeTargetReached = false;
+multiRun.roundPairDirectories = strings(0, 1);
+multiRun.errorIdentifier = "";
+multiRun.errorMessage = "";
+multiRun.createdAt = localTimestamp();
+multiRun.updatedAt = multiRun.createdAt;
+multiRun.cumulativeStateFile = string(fullfile( ...
+    directory, "cumulative.mat"));
+multiRun.manifestFile = string(fullfile(directory, "multi_run.mat"));
+multiRun.jsonFile = string(fullfile(directory, "multi_run.json"));
+multiRun.textFile = string(fullfile(directory, "multi_run.txt"));
+localSaveMultiRun(multiRun);
+end
+
+function multiRun = localUpdateMultiRun( ...
+        multiRun, roundRun, cumulative, roundIndex)
+multiRun.completedRounds = roundIndex;
+multiRun.currentRound = roundIndex;
+multiRun.latestLocalRunId = roundRun.localRunId;
+multiRun.latestPairDirectory = roundRun.pairDirectory;
+multiRun.roundPairDirectories(end+1, 1) = roundRun.pairDirectory;
+multiRun.cumulativeValidFrames = cumulative.validFrames;
+multiRun.cumulativeTestedBits = cumulative.testedBits;
+multiRun.cumulativeBitErrors = cumulative.bitErrors;
+multiRun.cumulativeBer = cumulative.ber;
+multiRun.cumulativeTargetReached = cumulative.targetReached;
+if roundIndex == multiRun.requestedRounds
+    multiRun.status = "completed";
+else
+    multiRun.status = "running";
+end
+multiRun.updatedAt = localTimestamp();
+localSaveMultiRun(multiRun);
+end
+
+function localSaveMultiRun(multiRun)
+multiRunManifest = multiRun;
+save(multiRun.manifestFile, "multiRunManifest");
+otfs_tr_write_json_atomic(multiRun.jsonFile, multiRun);
+textFields = ["version", "multiRunId", "receiveMode", ...
+    "requestedRounds", "completedRounds", "currentRound", "status", ...
+    "latestLocalRunId", "latestPairDirectory", ...
+    "cumulativeValidFrames", "cumulativeTestedBits", ...
+    "cumulativeBitErrors", "cumulativeBer", ...
+    "cumulativeTargetReached", "updatedAt"];
+otfs_tr_write_key_value_atomic(multiRun.textFile, multiRun, textFields);
+end
+
+function timestamp = localTimestamp()
+timestamp = string(datetime("now", "Format", "yyyy-MM-dd HH:mm:ss.SSS"));
 end
 
 function localStopCapture(rxRadio)

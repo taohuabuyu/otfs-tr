@@ -122,6 +122,7 @@ classdef otfsTrApplicationTest < matlab.unittest.TestCase
             cfg = otfs_tr_config();
             cfg.enableFractionalTimingCompensation = false;
             cfg.superframeLength = 8;
+            cfg.targetDecodedFrames = 6;
             cfg.txBufferFrameCount = 8;
             cfg.txBurstLength = cfg.txBufferFrameCount*cfg.frameLength10;
             cfg.maxDecodedFrames = 6;

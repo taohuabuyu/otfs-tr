@@ -1,62 +1,51 @@
 function cumulative = otfs_tr_accumulate_results(stateFile, result, cfg)
-%otfs_tr_accumulate_results Accumulate unique-frame BER across short captures.
+%otfs_tr_accumulate_results Accumulate complete per-round BER results.
 
 stateFile = string(stateFile);
 if strlength(stateFile) == 0
     error("otfs_tr:MissingCumulativeStateFile", ...
         "A cumulative BER state file is required.");
 end
-if string(localField(result, "referenceMode", "")) ~= ...
-        "unique-superframe"
-    error("otfs_tr:CumulativeBerRequiresUniqueFrames", ...
-        "Cumulative BER requires decoded unique-superframe IDs.");
-end
-
 if isfile(stateFile)
     saved = load(stateFile, "cumulative");
     cumulative = saved.cumulative;
-    if cumulative.superframeLength ~= cfg.superframeLength
+    if cumulative.version ~= 2 || ...
+            cumulative.effectiveBitsPerFrame ~= cfg.effectiveBitsPerFrame || ...
+            cumulative.modulationOrder ~= cfg.MMod
         error("otfs_tr:CumulativeBerConfigurationMismatch", ...
-            "The saved cumulative state uses a different superframe length.");
+            "The cumulative state uses a different format or waveform configuration.");
     end
 else
     cumulative = localEmptyState(cfg);
 end
 
-newValidFrames = 0;
-newTestedBits = 0;
-newBitErrors = 0;
-duplicatesSkipped = 0;
-for frameIndex = 1:numel(result.frameBer)
-    frameId = result.frameIds(frameIndex);
-    validFrame = isfinite(result.frameBer(frameIndex)) && ...
-        isfinite(frameId) && frameId >= 0 && ...
-        frameId < cumulative.superframeLength;
-    if ~validFrame
-        continue;
-    end
-    stateIndex = frameId + 1;
-    if cumulative.seenFrameIds(stateIndex)
-        duplicatesSkipped = duplicatesSkipped + 1;
-        continue;
-    end
-    bitErrors = result.frameDiagnostics(frameIndex).bitErrors;
-    cumulative.seenFrameIds(stateIndex) = true;
-    newValidFrames = newValidFrames + 1;
-    newTestedBits = newTestedBits + numel(bitErrors);
-    newBitErrors = newBitErrors + sum(bitErrors);
+runId = string(localField(result, "localRunId", ""));
+if strlength(runId) == 0
+    error("otfs_tr:MissingCumulativeRoundId", ...
+        "Each cumulative round requires a nonempty localRunId.");
+end
+if any(cumulative.processedRunIds == runId)
+    error("otfs_tr:DuplicateCumulativeRound", ...
+        "Round %s has already been accumulated.", runId);
+end
+
+roundValidFrames = localNonnegativeInteger(result, "validFrames");
+roundTestedBits = localNonnegativeInteger(result, "totalBits");
+roundBitErrors = localNonnegativeInteger(result, "totalErrors");
+if roundBitErrors > roundTestedBits
+    error("otfs_tr:InvalidCumulativeRoundResult", ...
+        "A round cannot contain more bit errors than tested bits.");
 end
 
 cumulative.batchCount = cumulative.batchCount + 1;
-cumulative.validFrames = cumulative.validFrames + newValidFrames;
-cumulative.testedBits = cumulative.testedBits + newTestedBits;
-cumulative.bitErrors = cumulative.bitErrors + newBitErrors;
-cumulative.duplicatesSkipped = cumulative.duplicatesSkipped + ...
-    duplicatesSkipped;
-cumulative.newValidFrames = newValidFrames;
-cumulative.newTestedBits = newTestedBits;
-cumulative.newBitErrors = newBitErrors;
-cumulative.latestRunId = string(localField(result, "localRunId", ""));
+cumulative.validFrames = cumulative.validFrames + roundValidFrames;
+cumulative.testedBits = cumulative.testedBits + roundTestedBits;
+cumulative.bitErrors = cumulative.bitErrors + roundBitErrors;
+cumulative.newValidFrames = roundValidFrames;
+cumulative.newTestedBits = roundTestedBits;
+cumulative.newBitErrors = roundBitErrors;
+cumulative.latestRunId = runId;
+cumulative.processedRunIds(end+1, 1) = runId;
 if cumulative.testedBits > 0
     cumulative.ber = cumulative.bitErrors/cumulative.testedBits;
 else
@@ -75,23 +64,31 @@ cumulative.updatedAt = string(datetime("now", ...
 localSaveStateAtomic(stateFile, cumulative);
 [folder, name] = fileparts(stateFile);
 jsonFile = fullfile(folder, name + ".json");
-jsonState = rmfield(cumulative, "seenFrameIds");
-otfs_tr_write_json_atomic(jsonFile, jsonState);
+otfs_tr_write_json_atomic(jsonFile, cumulative);
+textFile = fullfile(folder, name + ".txt");
+textFields = ["version", "accumulationMode", "batchCount", ...
+    "validFrames", "testedBits", "bitErrors", ...
+    "newValidFrames", "newTestedBits", "newBitErrors", ...
+    "ber", "zeroErrorUpper95", "targetReached", ...
+    "latestRunId", "updatedAt"];
+otfs_tr_write_key_value_atomic(textFile, cumulative, textFields);
 cumulative.stateFile = stateFile;
 cumulative.jsonFile = string(jsonFile);
+cumulative.textFile = string(textFile);
 end
 
 function cumulative = localEmptyState(cfg)
 cumulative = struct();
-cumulative.version = 1;
-cumulative.superframeLength = cfg.superframeLength;
+cumulative.version = 2;
+cumulative.accumulationMode = "per-round";
 cumulative.minimumTestBits = cfg.minimumTestBits;
-cumulative.seenFrameIds = false(cfg.superframeLength, 1);
+cumulative.effectiveBitsPerFrame = cfg.effectiveBitsPerFrame;
+cumulative.modulationOrder = cfg.MMod;
+cumulative.processedRunIds = strings(0, 1);
 cumulative.batchCount = 0;
 cumulative.validFrames = 0;
 cumulative.testedBits = 0;
 cumulative.bitErrors = 0;
-cumulative.duplicatesSkipped = 0;
 cumulative.newValidFrames = 0;
 cumulative.newTestedBits = 0;
 cumulative.newBitErrors = 0;
@@ -100,6 +97,19 @@ cumulative.zeroErrorUpper95 = NaN;
 cumulative.targetReached = false;
 cumulative.latestRunId = "";
 cumulative.updatedAt = "";
+end
+
+function value = localNonnegativeInteger(result, fieldName)
+if ~isfield(result, fieldName)
+    error("otfs_tr:InvalidCumulativeRoundResult", ...
+        "Round result is missing %s.", fieldName);
+end
+value = result.(fieldName);
+if ~isnumeric(value) || ~isscalar(value) || ~isfinite(value) || ...
+        value < 0 || mod(value, 1) ~= 0
+    error("otfs_tr:InvalidCumulativeRoundResult", ...
+        "Round result field %s must be one nonnegative integer.", fieldName);
+end
 end
 
 function localSaveStateAtomic(stateFile, cumulative)

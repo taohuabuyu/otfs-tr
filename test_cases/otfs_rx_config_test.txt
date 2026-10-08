@@ -1,3 +1,6 @@
 # OTFS-TR RX software-control configuration test case.
-# RX currently accepts only the local reference test-case path.
+# Single-round default. Use receive_mode=multi with a count of 2-100
+# to execute multiple capture/decode rounds automatically.
 testPayload=CASE-OTFS-8QAM-001-airid.mat
+receive_mode=single
+receive_round_count=1

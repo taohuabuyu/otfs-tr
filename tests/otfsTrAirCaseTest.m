@@ -123,6 +123,7 @@ classdef otfsTrAirCaseTest < matlab.unittest.TestCase
         function cfg = fastConfiguration()
             cfg = otfs_tr_apply_test_case_mode(otfs_tr_config());
             cfg.superframeLength = 8;
+            cfg.targetDecodedFrames = 6;
             cfg.txBufferFrameCount = 8;
             cfg.txBurstLength = 8*cfg.frameLength10;
             cfg.rxSamplesPerFrame = 8*cfg.frameLength10*cfg.rxSampleRateRatio;

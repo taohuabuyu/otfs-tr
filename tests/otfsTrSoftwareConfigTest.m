@@ -53,7 +53,46 @@ classdef otfsTrSoftwareConfigTest < matlab.unittest.TestCase
             rxConfig = otfs_tr_load_receiver_config(configFile);
 
             testCase.verifyEqual(rxConfig.test_case_file, caseFile);
+            testCase.verifyEqual(rxConfig.receive_mode, "single");
+            testCase.verifyEqual(rxConfig.receive_round_count, 1);
             testCase.verifyFalse(isfield(rxConfig, "equivalent_cfo_hz"));
+        end
+
+        function testRxConfigReadsMultiRoundPlan(testCase)
+            % Arrange.
+            cfg = otfsTrSoftwareConfigTest.smallConfiguration();
+            [caseFile, ~] = ...
+                otfsTrSoftwareConfigTest.writeTestCase(testCase, cfg);
+            content = "testPayload=" + caseFile + newline + ...
+                "receive_mode=multi" + newline + ...
+                "receive_round_count=3";
+            configFile = otfsTrSoftwareConfigTest.writeConfig( ...
+                testCase, content, "UTF-8");
+
+            % Act.
+            rxConfig = otfs_tr_load_receiver_config(configFile);
+
+            % Assert.
+            testCase.verifyEqual(rxConfig.receive_mode, "multi");
+            testCase.verifyEqual(rxConfig.receive_round_count, 3);
+        end
+
+        function testRxConfigRejectsMultiWithOneRound(testCase)
+            % Arrange.
+            cfg = otfsTrSoftwareConfigTest.smallConfiguration();
+            [caseFile, ~] = ...
+                otfsTrSoftwareConfigTest.writeTestCase(testCase, cfg);
+            content = "testPayload=" + caseFile + newline + ...
+                "receive_mode=multi" + newline + ...
+                "receive_round_count=1";
+            configFile = otfsTrSoftwareConfigTest.writeConfig( ...
+                testCase, content, "UTF-8");
+
+            % Act.
+            operation = @() otfs_tr_load_receiver_config(configFile);
+
+            % Assert.
+            testCase.verifyError(operation, "otfs_tr:InvalidReceivePlan");
         end
 
         function testRxConfigRejectsTransmitterCfo(testCase)
@@ -174,7 +213,8 @@ classdef otfsTrSoftwareConfigTest < matlab.unittest.TestCase
                 2.675e9, AbsTol=1e-6);
             testCase.verifyEqual(configured.berTestBitsPerFrame, 1881);
             testCase.verifyEqual(configured.minimumValidFrames, 532);
-            testCase.verifyEqual(configured.maxDecodedFrames, 586);
+            testCase.verifyEqual(configured.targetDecodedFrames, 800);
+            testCase.verifyEqual(configured.maxDecodedFrames, 800);
             testCase.verifyEqual(configured.minimumSpectralEfficiency, ...
                 2, AbsTol=1e-12);
             testCase.verifyWarningFree( ...
@@ -334,6 +374,8 @@ classdef otfsTrSoftwareConfigTest < matlab.unittest.TestCase
             cfg = otfs_tr_apply_test_case_mode(otfs_tr_config());
             cfg.resultRoot = string(tempdir);
             cfg.superframeLength = 8;
+            cfg.targetDecodedFrames = 6;
+            cfg.maxDecodedFrames = 6;
             cfg.txBufferFrameCount = 8;
             cfg.totalUniquePayloadBits = cfg.berTestBitsPerFrame * ...
                 cfg.superframeLength;

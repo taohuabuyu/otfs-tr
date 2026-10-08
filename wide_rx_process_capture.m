@@ -93,6 +93,7 @@ progressEnabled = logical(localGetField( ...
     p, "enableProgressReporting", false)) && ...
     strlength(string(localGetField(p, "progressFile", ""))) > 0;
 progressFile = string(localGetField(p, "progressFile", ""));
+progressTextFile = localProgressTextFile(progressFile);
 progressEveryBits = localGetField(p, ...
     "progressUpdateEveryBits", 100e3);
 progressNextBitThreshold = progressEveryBits;
@@ -190,6 +191,7 @@ frameParallelInfo.detectionElapsedSeconds = toc(detectionTimer);
 frameParallelInfo.progressReportingEnabled = progressEnabled;
 frameParallelInfo.progressDataQueueUsed = progressEnabled && useFrameParallel;
 frameParallelInfo.progressFile = progressFile;
+frameParallelInfo.progressTextFile = progressTextFile;
 frameParallelInfo.progressWriteCount = progressWriteCount;
 frameParallelInfo.sharedMpNoiseCalibrationRequested = ...
     sharedCalibrationRequested;
@@ -369,10 +371,20 @@ results.cfoEstimateHz = cfoEstimateHz;
         progress.data_queue_used = useFrameParallel;
         progress.detection_elapsed_seconds = detectionElapsedSeconds;
         otfs_tr_write_json_atomic(progressFile, progress);
+        otfs_tr_write_progress_text_atomic(progressTextFile, progress);
         progressWriteCount = progressWriteCount + 1;
         progressWriteElapsedSeconds(end+1, 1) = ...
             toc(progressTimer);
     end
+end
+
+function filePath = localProgressTextFile(progressFile)
+if strlength(progressFile) == 0
+    filePath = "";
+    return;
+end
+[folder, name] = fileparts(progressFile);
+filePath = string(fullfile(folder, name + ".txt"));
 end
 
 function payload = localFrameProgressPayload(frameIndex, ber, diag)

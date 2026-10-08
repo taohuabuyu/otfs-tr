@@ -22,6 +22,7 @@
 - 默认等效频偏：`-600 kHz`，搜索范围为`-800～800 kHz`。
 - BER门限：`1e-5`。
 - 最少测试比特：1,000,000 bit，零误码时同时要求`3/Nbits < 1e-5`。
+- 默认单轮解码目标：800帧，同时受采集完整帧数和1024帧超级帧上限约束。
 
 配置中心为`otfs_tr_config.m`。中心频差只是等效CFO测试，不能描述为真实运动速度产生的物理多普勒。
 
@@ -95,9 +96,26 @@ rxRun = run_otfs_tr_receiver("D:/config/otfs_rx_cfg.txt");
 ```
 
 RX完成采集后自动进行同步、CFO/SFO校正、OTFS解调、MP检测、BER计算并生成报告。`rxRun.responseFile`指向软件可读取的`response.json`。
-帧检测期间会原子更新运行目录中的`progress.json`。默认每累计`100000`个有效、去重后的测试比特发布一次阶段BER；处理开始和完成状态也会写入该文件。可通过中心配置`cfg.progressUpdateEveryBits`改为`200000`等其他正整数阈值。
+帧检测期间会原子更新运行目录中的`progress.txt`和`progress.json`。`progress.txt`采用固定的UTF-8 `key=value`格式，供仅支持TXT通信的软件轮询读取。默认每累计`100000`个有效、去重后的测试比特发布一次阶段BER；处理开始和完成状态也会写入这两个文件。文件保存的是最新快照，不追加历史记录。可通过中心配置`cfg.progressUpdateEveryBits`改为`200000`等其他正整数阈值。
 常规处理默认在指标和文本/JSON报告完成后立即返回，不生成耗时的PNG、FIG和结果MAT。需要完整诊断产物时，在中心配置中设置`cfg.generateDiagnosticArtifacts = true`后重新处理保存的IQ。
 每次处理完成后，软件还按`参与BER统计的接收bit数 / RX接收时长`计算传输速率，并在控制台、`acceptance_report.txt`和`response.json`中显示。
+
+RX配置TXT可选择单轮或自动多轮：
+
+```text
+testPayload=CASE-OTFS-8QAM-001-airid.mat
+receive_mode=single
+receive_round_count=1
+```
+
+自动执行3轮时改为：
+
+```text
+receive_mode=multi
+receive_round_count=3
+```
+
+多轮模式复用同一个RX对象，逐轮执行采集、保存IQ、解码和单轮报告。累计结果不按跨轮帧号去重，而是直接累加每一轮的`validFrames`、`totalBits`和`totalErrors`，累计BER为`ΣtotalErrors/ΣtotalBits`；同一个`local_run_id`不能重复提交。会话级状态保存到`results/multi_runs/<multi_run_id>/multi_run.txt`，累计BER保存到同目录的`cumulative.txt`。每一轮仍保留原有`results/pairs/<local_run_id>`目录和`progress.txt`。
 
 不使用配置TXT时，RX只需提供本地测试用例；频偏始终从捕获IQ中估计：
 

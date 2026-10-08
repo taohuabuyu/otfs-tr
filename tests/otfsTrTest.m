@@ -11,9 +11,9 @@ classdef otfsTrTest < matlab.unittest.TestCase
             "qpsk", struct("order", 4, "bitsPerFrame", 1300, ...
                 "minimumFrames", 770, "decodedFrames", 848), ...
             "qam8", struct("order", 8, "bitsPerFrame", 1608, ...
-                "minimumFrames", 622, "decodedFrames", 685), ...
+                "minimumFrames", 622, "decodedFrames", 800), ...
             "qam16", struct("order", 16, "bitsPerFrame", 2652, ...
-                "minimumFrames", 378, "decodedFrames", 416))
+                "minimumFrames", 378, "decodedFrames", 800))
     end
 
     methods (TestClassSetup)
@@ -99,10 +99,47 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 modulationCase.minimumFrames);
             testCase.verifyEqual(cfg.maxDecodedFrames, ...
                 modulationCase.decodedFrames);
+            testCase.verifyEqual(cfg.targetDecodedFrames, 800);
             testCase.verifyGreaterThanOrEqual(cfg.maxDecodedFrames, ...
                 cfg.minimumValidFrames);
             testCase.verifyLessThanOrEqual(cfg.maxDecodedFrames, ...
                 cfg.availableCaptureFrames);
+        end
+
+        function testRejectsInvalidTargetDecodedFrames(testCase)
+            % Arrange.
+            cfg = otfs_tr_config();
+            cfg.targetDecodedFrames = cfg.superframeLength + 1;
+
+            % Act.
+            operation = @() otfs_tr_validate_config(cfg);
+
+            % Assert.
+            testCase.verifyError(operation, ...
+                "otfs_tr:InvalidTargetDecodedFrames");
+        end
+
+        function testDefaultReceivePlanIsSingleRound(testCase)
+            % Arrange and act.
+            cfg = otfs_tr_config();
+
+            % Assert.
+            testCase.verifyEqual(cfg.receiveMode, "single");
+            testCase.verifyEqual(cfg.receiveRoundCount, 1);
+            testCase.verifyWarningFree(@() otfs_tr_validate_config(cfg));
+        end
+
+        function testRejectsInvalidReceivePlan(testCase)
+            % Arrange.
+            cfg = otfs_tr_config();
+            cfg.receiveMode = "multi";
+            cfg.receiveRoundCount = 1;
+
+            % Act.
+            operation = @() otfs_tr_validate_config(cfg);
+
+            % Assert.
+            testCase.verifyError(operation, "otfs_tr:InvalidReceivePlan");
         end
 
         function testPositiveAndNegativeCfoRecovery(testCase, offsetCase)
@@ -390,7 +427,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
                 "otfs_tr_process_capture"));
         end
 
-        function testRxSavesCaptureBeforePreparingLocalReference(testCase)
+        function testRxLoadsPlanBeforeCaptureAndBuildsReferenceAfter(testCase)
             projectRoot = fileparts(fileparts(mfilename("fullpath")));
             rxText = fileread(fullfile(projectRoot, ...
                 "run_otfs_tr_receiver.m"));
@@ -404,7 +441,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
             testCase.verifyNumElements(captureSavePosition, 1);
             testCase.verifyNumElements(configLoadPosition, 1);
             testCase.verifyNumElements(referencePosition, 1);
-            testCase.verifyLessThan(captureSavePosition, configLoadPosition);
+            testCase.verifyLessThan(configLoadPosition, captureSavePosition);
             testCase.verifyLessThan(captureSavePosition, referencePosition);
         end
 
@@ -575,6 +612,7 @@ classdef otfsTrTest < matlab.unittest.TestCase
             end
             cfg.enableFractionalTimingCompensation = false;
             cfg.superframeLength = 8;
+            cfg.targetDecodedFrames = 6;
             cfg.txBufferFrameCount = 8;
             cfg.txBurstLength = cfg.txBufferFrameCount*cfg.frameLength10;
             cfg.maxDecodedFrames = 6;
